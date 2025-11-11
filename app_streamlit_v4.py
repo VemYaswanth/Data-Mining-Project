@@ -1,10 +1,4 @@
-# Create v4.1 (same filename app_streamlit_v4.py) with auto-synthetic invoice/date handling
-import os, zipfile, textwrap
 
-base = "/mnt/data/market_basket_app_v4_1"
-os.makedirs(base, exist_ok=True)
-
-app_code = r'''
 # app_streamlit_v4.py
 # Omnichannel Retail Intelligence Dashboard (v4.1)
 # Tabs: Data Cleaning | Dataset & Rules | Temporal Insights | Customer Segmentation | Smart Recommender
@@ -546,32 +540,3 @@ with tab4:
                 st.markdown("**Explanation**")
                 best = list(recs.index[:3])
                 st.write(f"When customers buy **{', '.join(selected)}**, they often also purchase **{', '.join(best)}**. High lift indicates these add-ons co-occur more frequently than random chance.")
-'''
-
-with open(os.path.join(base, "app_streamlit_v4.py"), "w", encoding="utf-8") as f:
-    f.write(app_code)
-
-requirements = '''
-streamlit>=1.36.0
-pandas>=2.1.0
-numpy>=1.26.0
-plotly>=5.18.0
-networkx>=3.2
-mlxtend>=0.23.1
-scikit-learn>=1.3.0
-'''
-
-with open(os.path.join(base, "requirements.txt"), "w", encoding="utf-8") as f:
-    f.write(requirements)
-
-readme = '''
-# Omnichannel Retail Intelligence Dashboard (v4.1)
-
-**What’s new**
-- Auto-creates synthetic **Invoice** and **Date** when missing → rules & temporal analysis always work.
-- Five-tab end-to-end pipeline: Cleaning → Rules → Temporal → Segmentation → Recommender.
-
-## Run
-```bash
-pip install -r requirements.txt
-streamlit run app_streamlit_v4.py
