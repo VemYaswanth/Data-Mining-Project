@@ -1,7 +1,14 @@
+# Create v4.1 (same filename app_streamlit_v4.py) with auto-synthetic invoice/date handling
+import os, zipfile, textwrap
 
+base = "/mnt/data/market_basket_app_v4_1"
+os.makedirs(base, exist_ok=True)
+
+app_code = r'''
 # app_streamlit_v4.py
-# Omnichannel Retail Intelligence Dashboard (v4)
+# Omnichannel Retail Intelligence Dashboard (v4.1)
 # Tabs: Data Cleaning | Dataset & Rules | Temporal Insights | Customer Segmentation | Smart Recommender
+# Changes in v4.1: synthetic Invoice/Date generation when missing to ensure rules/temporal work.
 
 import streamlit as st
 import pandas as pd
@@ -19,8 +26,8 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
 st.set_page_config(page_title="Omnichannel Retail Intelligence Dashboard", page_icon="🧹", layout="wide")
-st.title("🧹 Omnichannel Retail Intelligence Dashboard (v4)")
-st.caption("End-to-end: Cleaning → Association Rules → Temporal → Segmentation → Recommender")
+st.title("🧹 Omnichannel Retail Intelligence Dashboard (v4.1)")
+st.caption("End-to-end: Cleaning → Association Rules → Temporal → Segmentation → Recommender. Auto-fixes missing invoice/date.")
 
 # --------------------------------
 # Helpers
@@ -43,12 +50,12 @@ def detect_schema(df: pd.DataFrame) -> dict:
     for cand in ["description", "productname", "product_name", "item"]:
         if cand in cols: schema["product"] = cols[cand]; break
     # invoice
-    for cand in ["invoiceno", "invoice", "basket_id", "transaction_id"]:
+    for cand in ["invoiceno", "invoice", "basket_id", "transaction_id", "invoice_no", "invoiceid"]:
         if cand in cols: schema["invoice"] = cols[cand]; break
     # customer/date
     for cand in ["customerid", "customer_id", "custid"]:
         if cand in cols: schema["customer"] = cols[cand]; break
-    for cand in ["transactiondate", "invoice_date", "date", "orderdate"]:
+    for cand in ["transactiondate", "invoice_date", "date", "orderdate", "transaction_date"]:
         if cand in cols: schema["date"] = cols[cand]; break
     # numeric
     for cand in ["finalamount", "final_amount", "totalamount", "total", "amount"]:
@@ -59,11 +66,11 @@ def detect_schema(df: pd.DataFrame) -> dict:
         if cand in cols: schema["quantity"] = cols[cand]; break
     # dims
     if "channel" in cols: schema["channel"] = cols["channel"]
-    for cand in ["storename", "store_name", "country"]:
+    for cand in ["storename", "store_name", "country", "store"]:
         if cand in cols: schema["store"] = cols[cand]; break
     if "aisle" in cols: schema["aisle"] = cols["aisle"]
     if "month" in cols: schema["month"] = cols["month"]
-    for cand in ["dayofweek", "day_of_week"]:
+    for cand in ["dayofweek", "day_of_week", "weekday"]:
         if cand in cols: schema["dayofweek"] = cols[cand]; break
     return schema
 
@@ -76,25 +83,40 @@ def ensure_datetime(df: pd.DataFrame, col: str):
     except Exception:
         return pd.to_datetime(df[col], errors="coerce")
 
+# v4.1: robust transactions builder with synthetic invoice/date when missing
 def build_transactions(df: pd.DataFrame, schema: dict) -> list:
-    prod = schema["product"]
-    if not prod: return []
+    prod = schema.get("product")
+    cust = schema.get("customer")
+    inv = schema.get("invoice")
+    date = schema.get("date")
+
+    if not prod or prod not in df.columns:
+        return []
+
     work = df.dropna(subset=[prod]).copy()
     work[prod] = normalize_products(work[prod])
-    if schema["invoice"] and schema["invoice"] in work.columns:
-        key = schema["invoice"]
-        tx = work.groupby(key)[prod].apply(lambda s: sorted(set(s.tolist()))).tolist()
-    elif schema["customer"] and schema["date"] and schema["customer"] in work.columns and schema["date"] in work.columns:
-        try:
-            work["_date"] = pd.to_datetime(work[schema["date"]]).dt.date
-        except Exception:
-            work["_date"] = work[schema["date"]].astype(str)
-        key = ["_date", schema["customer"]]
-        work["_tx"] = work[key].astype(str).agg("|".join, axis=1)
-        tx = work.groupby("_tx")[prod].apply(lambda s: sorted(set(s.tolist()))).tolist()
-    else:
-        tx = [[x] for x in work[prod].tolist()]
-    return [t for t in tx if len(t)>0]
+
+    # Synthetic invoice if missing
+    if not inv or inv not in work.columns:
+        if cust and cust in work.columns:
+            # group each customer stream into baskets of size ~3 rows
+            work["_synthetic_invoice_idx"] = work.groupby(cust).cumcount() // 3 + 1000
+            work["SyntheticInvoice"] = "INV" + work["_synthetic_invoice_idx"].astype(str)
+            inv = "SyntheticInvoice"
+        else:
+            work["SyntheticInvoice"] = "INV" + (pd.Series(range(1000, 1000+len(work))).astype(str))
+            inv = "SyntheticInvoice"
+        st.warning("⚠️ No invoice column found — synthetic invoices created automatically.")
+    # Synthetic date if missing
+    if not date or date not in work.columns:
+        rng = np.random.default_rng(42)
+        work["SyntheticDate"] = pd.Timestamp("2025-01-01") + pd.to_timedelta(rng.integers(0, 120, size=len(work)), unit="D")
+        date = "SyntheticDate"
+        st.info("ℹ️ No date column found — synthetic dates assigned for temporal analysis.")
+
+    # Build baskets by invoice
+    tx = work.groupby(inv)[prod].apply(lambda s: sorted(set(s.tolist()))).tolist()
+    return [t for t in tx if len(t) > 0]
 
 def encode_transactions(transactions: list) -> pd.DataFrame:
     te = TransactionEncoder()
@@ -160,8 +182,13 @@ def missing_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_rfm(df: pd.DataFrame, schema: dict):
     cust = schema["customer"]; date = schema["date"]; amt = schema["finalamount"]
-    if not (cust and date and amt): return pd.DataFrame()
-    if cust not in df.columns or date not in df.columns or amt not in df.columns:
+    # Allow synthetic date
+    if date is None or date not in df.columns:
+        if "SyntheticDate" in df.columns:
+            date = "SyntheticDate"
+        else:
+            return pd.DataFrame()
+    if not (cust and amt) or cust not in df.columns or amt not in df.columns:
         return pd.DataFrame()
     work = df.copy()
     work[date] = ensure_datetime(work, date)
@@ -205,7 +232,7 @@ def kmeans_clusters(df_rfm: pd.DataFrame, k=3):
 # Sidebar: Data Source
 # --------------------------------
 st.sidebar.header("Data Source")
-choice = st.sidebar.selectbox("Choose dataset", ["Upload CSV", "chain_cleaned.csv", "grocery_cleaned.csv"])
+choice = st.sidebar.selectbox("Choose dataset", ["Upload CSV", "chain_cleaned.csv", "grocery_cleaned.csv", "mock_retail_dataset.csv"])
 upl = st.sidebar.file_uploader("Upload CSV", type=["csv"])
 
 if choice != "Upload CSV" and upl is None:
@@ -297,13 +324,13 @@ def get_df_work():
 with tab1:
     df = get_df_work()
     st.subheader("Dataset Overview & Association Mining")
-    st.write("**Detected schema:**", schema)
+    st.write("**Detected schema:**", detect_schema(df))  # show updated schema post cleaning if columns added
     st.dataframe(df.head(30), use_container_width=True)
 
-    transactions = build_transactions(df, schema)
+    transactions = build_transactions(df, detect_schema(df))
     st.write(f"Transactions built: **{len(transactions):,}**")
     if not transactions:
-        st.error("Could not build transactions. Check product/invoice/customer/date columns.")
+        st.error("Could not build transactions. Check product/invoice/customer/date columns (synthetic will be created if missing).")
         st.stop()
 
     with st.spinner("Encoding baskets..."):
@@ -351,9 +378,10 @@ with tab1:
 with tab2:
     df = get_df_work()
     st.subheader("Temporal & Sequential Insights")
-    date_col = schema["date"]
-    amt_col = schema["finalamount"]
-    if date_col and date_col in df.columns:
+    local_schema = detect_schema(df)
+    date_col = local_schema["date"] if local_schema["date"] in df.columns else ("SyntheticDate" if "SyntheticDate" in df.columns else None)
+    amt_col = local_schema["finalamount"]
+    if date_col:
         work = df.copy()
         work[date_col] = ensure_datetime(work, date_col)
         work = work[~work[date_col].isna()].copy()
@@ -378,8 +406,8 @@ with tab2:
                 if not amt_monthly.empty:
                     st.line_chart(amt_monthly.set_index(date_col))
 
-            cust_col = schema["customer"]
-            prod_col = schema["product"]
+            cust_col = local_schema["customer"]
+            prod_col = local_schema["product"]
             if cust_col and prod_col and cust_col in work.columns and prod_col in work.columns:
                 seq_data = work.dropna(subset=[prod_col]).sort_values([cust_col, date_col])
                 seq_data[prod_col] = normalize_products(seq_data[prod_col])
@@ -403,9 +431,9 @@ with tab2:
 with tab3:
     df = get_df_work()
     st.subheader("Customer Segmentation (RFM & K-Means)")
-    rfm = build_rfm(df, schema)
+    rfm = build_rfm(df, detect_schema(df))
     if rfm.empty:
-        st.info("Need customer, date, and final amount columns for RFM segmentation.")
+        st.info("Need customer, (real or synthetic) date, and final amount columns for RFM segmentation.")
     else:
         st.markdown("**RFM Summary (Top 50)**")
         st.dataframe(rfm.head(50), use_container_width=True)
@@ -440,9 +468,11 @@ with tab4:
     st.subheader("Smart Recommender Dashboard")
     st.write("Use mined rules to recommend add-on products. Filter by time window and (optionally) segment.")
 
-    date_col = schema["date"]
-    prod_col = schema["product"]
-    if date_col and prod_col and date_col in df.columns and prod_col in df.columns:
+    local_schema = detect_schema(df)
+    date_col = local_schema["date"] if local_schema["date"] in df.columns else ("SyntheticDate" if "SyntheticDate" in df.columns else None)
+    prod_col = local_schema["product"]
+
+    if date_col and prod_col and prod_col in df.columns:
         df2 = df.copy()
         df2[date_col] = ensure_datetime(df2, date_col)
         min_d, max_d = df2[date_col].min(), df2[date_col].max()
@@ -456,13 +486,13 @@ with tab4:
         df2 = df.copy()
 
     seg_options = ["(none)"]
-    rfm_cache = build_rfm(df2, schema) if not df2.empty else pd.DataFrame()
+    rfm_cache = build_rfm(df2, local_schema) if not df2.empty else pd.DataFrame()
     if not rfm_cache.empty:
         seg_options += ["Low","Mid","High","VIP"]
     picked_seg = st.selectbox("Filter by RFM Segment (optional)", seg_options)
 
     try:
-        transactions2 = build_transactions(df2, schema)
+        transactions2 = build_transactions(df2, detect_schema(df2))
         enc2 = encode_transactions(transactions2) if transactions2 else pd.DataFrame()
         fi2, _ = run_mining(enc2, "FP-Growth", 0.01, 3) if not enc2.empty else (pd.DataFrame(), 0)
         rules2 = make_rules(fi2, "confidence", 0.3) if not fi2.empty else pd.DataFrame()
@@ -479,9 +509,9 @@ with tab4:
         selected = st.multiselect("Select base product(s)", all_items)
 
         if selected:
-            if picked_seg != "(none)" and not rfm_cache.empty and schema["customer"] and schema["customer"] in df2.columns:
+            if picked_seg != "(none)" and not rfm_cache.empty and local_schema["customer"] and local_schema["customer"] in df2.columns:
                 seg_customers = set(rfm_cache[rfm_cache["Segment"]==picked_seg]["customerid"])
-                df_seg = df2[df2[schema["customer"]].isin(seg_customers)].copy()
+                df_seg = df2[df2[local_schema["customer"]].isin(seg_customers)].copy()
             else:
                 df_seg = df2
 
@@ -498,12 +528,12 @@ with tab4:
                 st.dataframe(recs, use_container_width=True)
                 st.bar_chart(recs["mean_lift"])
 
-                inv_col = schema["invoice"]
-                if prod_col in df_seg.columns and schema["finalamount"] in df_seg.columns and inv_col and inv_col in df_seg.columns:
+                inv_col = local_schema["invoice"] if local_schema["invoice"] in df_seg.columns else ("SyntheticInvoice" if "SyntheticInvoice" in df_seg.columns else None)
+                if inv_col and prod_col in df_seg.columns and local_schema["finalamount"] in df_seg.columns:
                     df_seg[prod_col] = normalize_products(df_seg[prod_col])
                     by_inv = df_seg.groupby(inv_col).agg(
                         items=(prod_col, lambda s: set(s.tolist())),
-                        revenue=(schema["finalamount"], "sum")
+                        revenue=(local_schema["finalamount"], "sum")
                     )
                     impacts = []
                     for item in recs.index:
@@ -516,3 +546,32 @@ with tab4:
                 st.markdown("**Explanation**")
                 best = list(recs.index[:3])
                 st.write(f"When customers buy **{', '.join(selected)}**, they often also purchase **{', '.join(best)}**. High lift indicates these add-ons co-occur more frequently than random chance.")
+'''
+
+with open(os.path.join(base, "app_streamlit_v4.py"), "w", encoding="utf-8") as f:
+    f.write(app_code)
+
+requirements = '''
+streamlit>=1.36.0
+pandas>=2.1.0
+numpy>=1.26.0
+plotly>=5.18.0
+networkx>=3.2
+mlxtend>=0.23.1
+scikit-learn>=1.3.0
+'''
+
+with open(os.path.join(base, "requirements.txt"), "w", encoding="utf-8") as f:
+    f.write(requirements)
+
+readme = '''
+# Omnichannel Retail Intelligence Dashboard (v4.1)
+
+**What’s new**
+- Auto-creates synthetic **Invoice** and **Date** when missing → rules & temporal analysis always work.
+- Five-tab end-to-end pipeline: Cleaning → Rules → Temporal → Segmentation → Recommender.
+
+## Run
+```bash
+pip install -r requirements.txt
+streamlit run app_streamlit_v4.py
