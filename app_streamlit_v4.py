@@ -509,18 +509,42 @@ with tab4:
             else:
                 df_seg = df2
 
-            sub = rules2[rules2["antecedents"].apply(lambda s: set(selected).issubset(s))]
-            if sub.empty:
-                st.info("No direct rules for selected base product(s). Try selecting one item or lowering thresholds in Tab 1.")
-            else:
-                recs = (sub.explode("consequents")
-                          .groupby("consequents")
-                          .agg(mean_conf=("confidence","mean"), mean_lift=("lift","mean"), count=("confidence","size"))
-                          .sort_values(["mean_lift","mean_conf","count"], ascending=False)
-                          .head(10))
-                st.markdown("**Top Recommended Add-ons**")
-                st.dataframe(recs, use_container_width=True)
-                st.bar_chart(recs["mean_lift"])
+           sub = rules2[rules2["antecedents"].apply(lambda s: set(selected).issubset(s))]
+if sub.empty:
+    st.info("No direct rules for selected base product(s). Try selecting one item or lowering thresholds in Tab 1.")
+else:
+
+    # ---------------------------------------------------------
+    # OPTION A — REMOVE TOP GLOBAL POPULAR ITEMS (staples)
+    # ---------------------------------------------------------
+    # Compute global item support
+    try:
+        item_support = enc2.mean().sort_values(ascending=False)
+        top_staples = set(item_support.head(3).index)   # top 3 most frequent items
+    except Exception:
+        top_staples = set()
+
+    # Remove them from consequents
+    sub_filtered = sub.copy()
+    sub_filtered["consequents"] = sub_filtered["consequents"].apply(
+        lambda s: {x for x in s if x not in top_staples}
+    )
+    # Drop rows where consequents became empty
+    sub_filtered = sub_filtered[sub_filtered["consequents"].apply(lambda s: len(s) > 0)]
+
+    if sub_filtered.empty:
+        st.warning("Most popular items were filtered out (apples/bananas/bread). Try different base product.")
+        st.stop()
+
+    # Now compute recommendations WITHOUT staple items
+    recs = (sub_filtered.explode("consequents")
+              .groupby("consequents")
+              .agg(mean_conf=("confidence","mean"),
+                   mean_lift=("lift","mean"),
+                   count=("confidence","size"))
+              .sort_values(["mean_lift","mean_conf","count"], ascending=False)
+              .head(10))
+
 
                 inv_col = local_schema["invoice"] if local_schema["invoice"] in df_seg.columns else ("SyntheticInvoice" if "SyntheticInvoice" in df_seg.columns else None)
                 if inv_col and prod_col in df_seg.columns and local_schema["finalamount"] in df_seg.columns:
