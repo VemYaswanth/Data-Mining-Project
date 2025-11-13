@@ -453,7 +453,6 @@ with tab3:
                                                     AvgRecency=("Recency","mean")).round(2)
         st.markdown("**Segment Summary**")
         st.dataframe(seg_summary, use_container_width=True)
-
 # --------------------------------
 # TAB 4: Smart Recommender
 # --------------------------------
@@ -463,12 +462,18 @@ with tab4:
     st.write("Use mined rules to recommend add-on products. Filter by time window and (optionally) segment.")
 
     local_schema = detect_schema(df)
-    date_col = local_schema["date"] if local_schema["date"] in df.columns else ("SyntheticDate" if "SyntheticDate" in df.columns else None)
+    date_col = (
+        local_schema["date"]
+        if local_schema["date"] in df.columns
+        else "SyntheticDate" if "SyntheticDate" in df.columns else None
+    )
     prod_col = local_schema["product"]
 
+    # --- Date filtering ---
     if date_col and prod_col and prod_col in df.columns:
         df2 = df.copy()
         df2[date_col] = ensure_datetime(df2, date_col)
+
         min_d, max_d = df2[date_col].min(), df2[date_col].max()
         if pd.isna(min_d) or pd.isna(max_d):
             df2 = df2
@@ -479,12 +484,15 @@ with tab4:
     else:
         df2 = df.copy()
 
+    # --- RFM Segments ---
     seg_options = ["(none)"]
     rfm_cache = build_rfm(df2, local_schema) if not df2.empty else pd.DataFrame()
     if not rfm_cache.empty:
-        seg_options += ["Low","Mid","High","VIP"]
+        seg_options += ["Low", "Mid", "High", "VIP"]
+
     picked_seg = st.selectbox("Filter by RFM Segment (optional)", seg_options)
 
+    # --- Rebuild transactions + rules on filtered df2 ---
     try:
         transactions2 = build_transactions(df2, detect_schema(df2))
         enc2 = encode_transactions(transactions2) if transactions2 else pd.DataFrame()
@@ -495,71 +503,114 @@ with tab4:
 
     if rules2.empty:
         st.warning("No rules available. Clean the data in Tab 0 and/or adjust mining thresholds in Tab 1.")
-    else:
-        try:
-            all_items = sorted(set().union(*rules2['antecedents']).union(*rules2['consequents']))
-        except Exception:
-            all_items = sorted(pd.unique(df2.get(prod_col, pd.Series([], dtype=str)).astype(str).str.upper()))
-        selected = st.multiselect("Select base product(s)", all_items)
-
-        if selected:
-            if picked_seg != "(none)" and not rfm_cache.empty and local_schema["customer"] and local_schema["customer"] in df2.columns:
-                seg_customers = set(rfm_cache[rfm_cache["Segment"]==picked_seg]["customerid"])
-                df_seg = df2[df2[local_schema["customer"]].isin(seg_customers)].copy()
-            else:
-                df_seg = df2
-
-           sub = rules2[rules2["antecedents"].apply(lambda s: set(selected).issubset(s))]
-        if sub.empty:
-    st.info("No direct rules for selected base product(s). Try selecting one item or lowering thresholds in Tab 1.")
-        else:
-    # ---------------------------------------------------------
-    # OPTION A — REMOVE TOP GLOBAL POPULAR ITEMS (staples)
-    # ---------------------------------------------------------
-    # Compute global item support
-    try:
-        item_support = enc2.mean().sort_values(ascending=False)
-        top_staples = set(item_support.head(3).index)   # top 3 most frequent items
-    except Exception:
-        top_staples = set()
-
-    # Remove them from consequents
-    sub_filtered = sub.copy()
-    sub_filtered["consequents"] = sub_filtered["consequents"].apply(
-        lambda s: {x for x in s if x not in top_staples}
-    )
-    # Drop rows where consequents became empty
-    sub_filtered = sub_filtered[sub_filtered["consequents"].apply(lambda s: len(s) > 0)]
-
-    if sub_filtered.empty:
-        st.warning("Most popular items were filtered out (apples/bananas/bread). Try different base product.")
         st.stop()
 
-    # Now compute recommendations WITHOUT staple items
-    recs = (sub_filtered.explode("consequents")
-              .groupby("consequents")
-              .agg(mean_conf=("confidence","mean"),
-                   mean_lift=("lift","mean"),
-                   count=("confidence","size"))
-              .sort_values(["mean_lift","mean_conf","count"], ascending=False)
-              .head(10))
+    # --- Product choices ---
+    try:
+        all_items = sorted(set().union(*rules2["antecedents"]).union(*rules2["consequents"]))
+    except Exception:
+        all_items = sorted(
+            pd.unique(df2.get(prod_col, pd.Series([], dtype=str)).astype(str).str.upper())
+        )
 
+    selected = st.multiselect("Select base product(s)", all_items)
 
-                inv_col = local_schema["invoice"] if local_schema["invoice"] in df_seg.columns else ("SyntheticInvoice" if "SyntheticInvoice" in df_seg.columns else None)
-                if inv_col and prod_col in df_seg.columns and local_schema["finalamount"] in df_seg.columns:
-                    df_seg[prod_col] = normalize_products(df_seg[prod_col])
-                    by_inv = df_seg.groupby(inv_col).agg(
-                        items=(prod_col, lambda s: set(s.tolist())),
-                        revenue=(local_schema["finalamount"], "sum")
-                    )
-                    impacts = []
-                    for item in recs.index:
-                        mask = by_inv["items"].apply(lambda s: set(selected).issubset(s) and (item in s))
-                        impacts.append({"item": item, "support_in_invoices": int(mask.sum()), "revenue_sum": by_inv.loc[mask, "revenue"].sum()})
-                    impact_df = pd.DataFrame(impacts).sort_values("revenue_sum", ascending=False)
-                    st.markdown("**Estimated Revenue Impact (where rule holds)**")
-                    st.dataframe(impact_df, use_container_width=True)
+    if selected:
+        # --- Segment Filtering ---
+        if (
+            picked_seg != "(none)"
+            and not rfm_cache.empty
+            and local_schema["customer"]
+            and local_schema["customer"] in df2.columns
+        ):
+            seg_customers = set(rfm_cache[rfm_cache["Segment"] == picked_seg]["customerid"])
+            df_seg = df2[df2[local_schema["customer"]].isin(seg_customers)].copy()
+        else:
+            df_seg = df2
 
-                st.markdown("**Explanation**")
-                best = list(recs.index[:3])
-                st.write(f"When customers buy **{', '.join(selected)}**, they often also purchase **{', '.join(best)}**. High lift indicates these add-ons co-occur more frequently than random chance.")
+        sub = rules2[rules2["antecedents"].apply(lambda s: set(selected).issubset(s))]
+        if sub.empty:
+            st.info(
+                "No direct rules for selected base product(s). Try selecting one item or lowering thresholds in Tab 1."
+            )
+            st.stop()
+
+        # ---------------------------------------------------------
+        # v4.3 FIX — REMOVE TOP GLOBAL “STAPLE” ITEMS FROM CONSEQUENTS
+        # ---------------------------------------------------------
+        try:
+            item_support = enc2.mean().sort_values(ascending=False)
+            top_staples = set(item_support.head(3).index)  # top 3 most frequent items
+        except Exception:
+            top_staples = set()
+
+        sub_filtered = sub.copy()
+        sub_filtered["consequents"] = sub_filtered["consequents"].apply(
+            lambda s: {x for x in s if x not in top_staples}
+        )
+
+        # Drop empty consequents
+        sub_filtered = sub_filtered[sub_filtered["consequents"].apply(lambda s: len(s) > 0)]
+
+        if sub_filtered.empty:
+            st.warning(
+                "Most popular items (e.g., apples/bananas/bread) were filtered out. "
+                "Try another product or reduce staple filtering."
+            )
+            st.stop()
+
+        # --- Final Recommendations ---
+        recs = (
+            sub_filtered.explode("consequents")
+            .groupby("consequents")
+            .agg(
+                mean_conf=("confidence", "mean"),
+                mean_lift=("lift", "mean"),
+                count=("confidence", "size"),
+            )
+            .sort_values(["mean_lift", "mean_conf", "count"], ascending=False)
+            .head(10)
+        )
+
+        st.markdown("**Top Recommended Add-ons (Staples Filtered)**")
+        st.dataframe(recs, use_container_width=True)
+        st.bar_chart(recs["mean_lift"])
+
+        # --- Revenue Impact ---
+        inv_col = (
+            local_schema["invoice"]
+            if local_schema["invoice"] in df_seg.columns
+            else "SyntheticInvoice"
+            if "SyntheticInvoice" in df_seg.columns
+            else None
+        )
+
+        if inv_col and prod_col in df_seg.columns and local_schema["finalamount"] in df_seg.columns:
+            df_seg[prod_col] = normalize_products(df_seg[prod_col])
+            by_inv = df_seg.groupby(inv_col).agg(
+                items=(prod_col, lambda s: set(s.tolist())),
+                revenue=(local_schema["finalamount"], "sum"),
+            )
+            impacts = []
+            for item in recs.index:
+                mask = by_inv["items"].apply(
+                    lambda s: set(selected).issubset(s) and (item in s)
+                )
+                impacts.append(
+                    {
+                        "item": item,
+                        "support_in_invoices": int(mask.sum()),
+                        "revenue_sum": by_inv.loc[mask, "revenue"].sum(),
+                    }
+                )
+            impact_df = pd.DataFrame(impacts).sort_values("revenue_sum", ascending=False)
+            st.markdown("**Estimated Revenue Impact (where rule holds)**")
+            st.dataframe(impact_df, use_container_width=True)
+
+        st.markdown("**Explanation**")
+        best = list(recs.index[:3])
+        st.write(
+            f"When customers buy **{', '.join(selected)}**, they often also purchase "
+            f"**{', '.join(best)}**. High lift indicates these add-ons co-occur more frequently than random chance — "
+            f"after filtering out very common staple items."
+        )
