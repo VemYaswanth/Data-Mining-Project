@@ -16,3 +16,5 @@ streamlit run app_streamlit_v2.py
 
 Use sidebar to upload or pick sample data (`chain_cleaned.csv` or `grocery_cleaned.csv`).
 Then, mine rules and explore recommendations interactively!
+https://dm-protov5.streamlit.app/ link to prototypr-V5
+https://dm-dash.streamlit.app/ link to protoype-V4
