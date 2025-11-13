@@ -510,10 +510,9 @@ with tab4:
                 df_seg = df2
 
            sub = rules2[rules2["antecedents"].apply(lambda s: set(selected).issubset(s))]
-if sub.empty:
+        if sub.empty:
     st.info("No direct rules for selected base product(s). Try selecting one item or lowering thresholds in Tab 1.")
-else:
-
+        else:
     # ---------------------------------------------------------
     # OPTION A — REMOVE TOP GLOBAL POPULAR ITEMS (staples)
     # ---------------------------------------------------------
