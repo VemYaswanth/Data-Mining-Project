@@ -1,14 +1,8 @@
-# app_streamlit_v5_2.py
+# app_streamlit_v5_3.py
 # ----------------------------------------------------------
-# Retail Intelligence Dashboard v5.2 (Clean Data Version)
-# - Input: Assumes Cleaned CSV
-# - Schema: Auto-detects columns silently
-# - Tabs:
-#     1. Patterns & Model Comparison
-#     2. Temporal & Sequential
-#     3. Customer Segmentation
-#     4. Smart Recommender
-#     5. Visual Explanations
+# Retail Intelligence Dashboard v5.3
+# - Fix: Prevents ID columns (numeric) from being detected as Dates
+# - Fix: Improves Invoice detection to avoid categorical columns
 # ----------------------------------------------------------
 
 import streamlit as st
@@ -31,15 +25,15 @@ from sklearn.preprocessing import StandardScaler
 # Streamlit configuration
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="Retail Intelligence Dashboard v5.2",
+    page_title="Retail Intelligence Dashboard v5.3",
     page_icon="🧠",
     layout="wide",
 )
 
-st.title("🧠 Retail Intelligence Dashboard v5.2")
+st.title("🧠 Retail Intelligence Dashboard v5.3")
 st.caption(
     "Analytics Pipeline: Patterns → Temporal → Segmentation → Recommender.\n"
-    "Ready for analysis on pre-cleaned datasets."
+    "v5.3: Robust column detection for raw datasets."
 )
 
 # =========================================================
@@ -68,10 +62,15 @@ def detect_invoice_column(df: pd.DataFrame, product_col: str | None):
     for col in df.columns:
         if col == product_col: continue
         nun = df[col].nunique(dropna=True)
-        if nun <= 1 or nun >= n: continue
+        # Skip constant, unique, or low-cardinality categorical columns (e.g. Aisle)
+        if nun <= 10 or nun >= n: continue
+        
         avg_group = n / nun if nun > 0 else 0
+        # Invoice should group items, but not too aggressively (avg size > 1.5)
         if avg_group < 1.5: continue
+        
         candidates.append((col, avg_group))
+    
     if not candidates: return None
     candidates.sort(key=lambda x: x[1], reverse=True)
     return candidates[0][0]
@@ -94,6 +93,10 @@ def detect_date_column(df: pd.DataFrame):
     best = None
     best_rate = 0
     for col in df.columns:
+        # FIX: Skip numeric columns so IDs (e.g. 2824) aren't read as timestamps
+        if pd.api.types.is_numeric_dtype(df[col]):
+            continue
+            
         try:
             parsed = pd.to_datetime(df[col], errors="coerce", infer_datetime_format=True)
             ok_rate = parsed.notna().mean()
@@ -120,14 +123,8 @@ def detect_amount_column(df: pd.DataFrame):
     return variances[0][0] if variances else None
 
 def map_columns(df: pd.DataFrame, schema: dict):
-    """
-    Ensures the dataframe has the necessary mapped columns.
-    If the clean dataset is missing a column (e.g. no Customer ID),
-    it generates a placeholder so the code doesn't crash, but quietly.
-    """
     work = df.copy()
-    n = len(work)
-
+    
     # Product
     if schema["product"] is None:
         work["Product_ID"] = "ITEM_" + work.index.astype(str)
@@ -146,7 +143,6 @@ def map_columns(df: pd.DataFrame, schema: dict):
         schema["date"] = "Date_Mapped"
     else:
         work[schema["date"]] = pd.to_datetime(work[schema["date"]], errors="coerce")
-        # If parsing failed completely, fallback
         if work[schema["date"]].notna().sum() == 0:
              work["Date_Mapped"] = pd.Timestamp("2025-01-01")
              schema["date"] = "Date_Mapped"
@@ -158,7 +154,7 @@ def map_columns(df: pd.DataFrame, schema: dict):
 
     # Invoice
     if schema["invoice"] is None:
-        # Fallback grouping if no invoice ID exists
+        # Fallback: Create synthetic baskets if no explicit Invoice ID found
         work["Invoice_Mapped"] = work.index // 3 
         schema["invoice"] = "Invoice_Mapped"
 
@@ -254,13 +250,11 @@ def build_rfm(df: pd.DataFrame, schema: dict):
         Monetary=(amt, "sum")
     ).reset_index().rename(columns={cust: "customerid"})
     
-    # Simple Binning
     try:
         grp["R_Score"] = pd.qcut(grp["Recency"].rank(method="first"), 5, labels=[5, 4, 3, 2, 1])
         grp["F_Score"] = pd.qcut(grp["Frequency"].rank(method="first"), 5, labels=[1, 2, 3, 4, 5])
         grp["M_Score"] = pd.qcut(grp["Monetary"].rank(method="first"), 5, labels=[1, 2, 3, 4, 5])
     except:
-        # Fallback if qcut fails due to low cardinality
         grp["R_Score"] = pd.cut(grp["Recency"], bins=5, labels=[5, 4, 3, 2, 1], include_lowest=True)
         grp["F_Score"] = pd.cut(grp["Frequency"], bins=5, labels=[1, 2, 3, 4, 5], include_lowest=True)
         grp["M_Score"] = pd.cut(grp["Monetary"], bins=5, labels=[1, 2, 3, 4, 5], include_lowest=True)
@@ -315,24 +309,21 @@ def rules_to_recommendations(rules: pd.DataFrame, base_items, enc: pd.DataFrame)
     return recs
 
 # =========================================================
-# 1. Upload Dataset (Cleaned)
+# 1. Upload Dataset
 # =========================================================
 
 st.sidebar.header("Data Source")
-uploaded = st.sidebar.file_uploader("Upload Cleaned CSV", type=["csv"])
+uploaded = st.sidebar.file_uploader("Upload CSV", type=["csv"])
 
 if uploaded is None:
-    st.info("👋 Welcome! Please upload your **cleaned** CSV dataset to begin analysis.")
+    st.info("👋 Upload your dataset to begin.")
     st.stop()
 
-# Read CSV
 df_raw = pd.read_csv(uploaded)
 
 # =========================================================
-# 2. Silent Schema Mapping
+# 2. Schema Mapping
 # =========================================================
-# We still detect columns to be robust against different naming conventions,
-# but we do not show the verbose output to the user.
 
 product_col = detect_product_column(df_raw)
 invoice_col = detect_invoice_column(df_raw, product_col)
@@ -356,164 +347,108 @@ with st.expander("View Dataset Details & Mapped Schema"):
     st.json(schema)
 
 # =========================================================
-# Tabs Layout (Cleaning Tab Removed)
+# Tabs
 # =========================================================
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    [
-        "📊 Patterns",
-        "🕒 Temporal",
-        "👥 Segmentation",
-        "🛒 Recommender",
-        "📈 Pipeline",
-    ]
+    ["📊 Patterns", "🕒 Temporal", "👥 Segmentation", "🛒 Recommender", "📈 Pipeline"]
 )
 
-# =========================================================
-# TAB 1: Frequent Patterns
-# =========================================================
-
+# TAB 1: Patterns
 with tab1:
     st.subheader("Frequent Patterns & Market Basket Analysis")
-    
     transactions = build_transactions(df_work, schema)
     if not transactions:
         st.warning("Could not build transactions. Check your Invoice/Product columns.")
         st.stop()
         
     df_enc = encode_transactions(transactions)
-    
     colA, colB = st.columns(2)
     min_support = colA.slider("Min Support", 0.001, 0.1, 0.01, step=0.001)
     max_len = colB.slider("Max Itemset Length", 2, 5, 3)
     
-    # Compare Models
     fi_fp, t_fp = run_mining(df_enc, "FP-Growth", min_support, max_len)
-    fi_ap, t_ap = run_mining(df_enc, "Apriori", min_support, max_len)
-    
-    st.markdown(f"**FP-Growth found {len(fi_fp)} itemsets** in {t_fp:.4f}s vs **Apriori** in {t_ap:.4f}s.")
+    st.markdown(f"**FP-Growth found {len(fi_fp)} itemsets** in {t_fp:.4f}s.")
 
-    # Rules
     metric = st.selectbox("Rule Metric", ["confidence", "lift"])
     min_metric = st.slider(f"Min {metric.title()}", 0.1, 1.0, 0.3, step=0.05)
-    
     rules = make_rules(fi_fp, metric, min_metric)
     
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        if not fi_fp.empty:
-            st.plotly_chart(plot_top_itemsets(fi_fp, n=15), use_container_width=True)
-    with col2:
-        if not rules.empty:
-            st.plotly_chart(plot_rules_scatter(rules), use_container_width=True)
-
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        if not fi_fp.empty: st.plotly_chart(plot_top_itemsets(fi_fp), use_container_width=True)
+    with c2:
+        if not rules.empty: st.plotly_chart(plot_rules_scatter(rules), use_container_width=True)
     if not rules.empty:
-        st.markdown("### Association Network")
-        st.plotly_chart(build_association_network(rules, topn=30), use_container_width=True)
+        st.plotly_chart(build_association_network(rules), use_container_width=True)
         
     st.session_state["df_enc"] = df_enc
     st.session_state["rules"] = rules
 
-# =========================================================
 # TAB 2: Temporal
-# =========================================================
-
 with tab2:
     st.subheader("Temporal & Sequential Analysis")
     d_col = schema["date"]
-    
     if d_col in df_work.columns:
         df_t = df_work.dropna(subset=[d_col]).copy()
-        
         # Monthly
-        monthly = df_t.groupby(df_t[d_col].dt.to_period("M")).size().reset_index(name="Count")
-        monthly[d_col] = monthly[d_col].astype(str)
-        st.line_chart(monthly.set_index(d_col))
-        
+        try:
+            monthly = df_t.groupby(df_t[d_col].dt.to_period("M")).size().reset_index(name="Count")
+            monthly[d_col] = monthly[d_col].astype(str)
+            st.line_chart(monthly.set_index(d_col))
+        except:
+            st.info("Could not plot monthly trend (date format issue).")
         # Weekday
-        weekday = df_t.groupby(df_t[d_col].dt.day_name()).size().reindex(
-            ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        ).reset_index(name="Count")
-        st.bar_chart(weekday.set_index(d_col))
+        try:
+            weekday = df_t.groupby(df_t[d_col].dt.day_name()).size().reset_index(name="Count")
+            st.bar_chart(weekday.set_index(d_col))
+        except: pass
     else:
-        st.warning("No valid Date column found for temporal analysis.")
+        st.warning("No valid Date column found.")
 
-# =========================================================
 # TAB 3: Segmentation
-# =========================================================
-
 with tab3:
-    st.subheader("Customer Segmentation (RFM + K-Means)")
-    
+    st.subheader("Customer Segmentation")
     rfm = build_rfm(df_work, schema)
-    
     if rfm.empty:
-        st.warning("RFM Analysis requires valid Customer, Date, and Amount columns.")
+        st.warning("RFM requires valid Customer, Date, and Amount columns.")
     else:
         k = st.slider("Clusters (K)", 2, 6, 3)
         rfm_km, centers = kmeans_clusters(rfm, k)
-        
         c1, c2 = st.columns([2, 1])
         with c1:
-            fig = px.scatter(
-                rfm_km, x="Frequency", y="Monetary", color=rfm_km["KMeansCluster"].astype(str),
-                hover_data=["customerid", "RFM_Score", "Segment"],
-                title="Segments: Frequency vs Monetary"
+            st.plotly_chart(
+                px.scatter(rfm_km, x="Frequency", y="Monetary", color=rfm_km["KMeansCluster"].astype(str),
+                           hover_data=["customerid", "RFM_Score", "Segment"],
+                           title="Segments: Frequency vs Monetary"),
+                use_container_width=True
             )
-            st.plotly_chart(fig, use_container_width=True)
-            
         with c2:
-            st.markdown("**Cluster Centers**")
             st.dataframe(centers, use_container_width=True)
-            
-        st.markdown("**Segment Distribution**")
-        st.bar_chart(rfm_km["Segment"].value_counts())
 
-# =========================================================
 # TAB 4: Recommender
-# =========================================================
-
 with tab4:
     st.subheader("Smart Recommender")
     rules = st.session_state.get("rules", pd.DataFrame())
     df_enc = st.session_state.get("df_enc", pd.DataFrame())
-    
     if rules.empty:
-        st.warning("Please run Tab 1 (Patterns) first to generate rules.")
+        st.warning("Run Patterns tab first.")
     else:
         all_items = sorted(set().union(*rules["antecedents"]).union(*rules["consequents"]))
         selected = st.multiselect("Select Basket Items", all_items)
-        
         if selected:
             recs = rules_to_recommendations(rules, selected, df_enc)
-            if recs.empty:
-                st.info("No recommendations found (try lowering confidence/lift in Tab 1).")
-            else:
-                st.markdown("### Recommended Add-ons")
+            if not recs.empty:
                 st.dataframe(recs, use_container_width=True)
+            else:
+                st.info("No recommendations found.")
 
-# =========================================================
-# TAB 5: Visuals
-# =========================================================
-
+# TAB 5: Pipeline
 with tab5:
     st.subheader("Project Pipeline")
-    
-    labels = ["Cleaned Data", "Transactions", "Frequent Itemsets", "Association Rules", "Recommendations"]
-    source = [0, 1, 2, 3]
-    target = [1, 2, 3, 4]
-    value = [10, 10, 10, 10]
-    
+    labels = ["Data", "Transactions", "Frequent Itemsets", "Association Rules", "Recommendations"]
     fig = go.Figure(data=[go.Sankey(
-        node=dict(pad=15, thickness=20, line=dict(color="black", width=0.5), label=labels),
-        link=dict(source=source, target=target, value=value)
+        node=dict(pad=15, thickness=20, label=labels),
+        link=dict(source=[0, 1, 2, 3], target=[1, 2, 3, 4], value=[10, 10, 10, 10])
     )])
     st.plotly_chart(fig, use_container_width=True)
-    
-    st.markdown("""
-    ### Methodology
-    1. **Data Ingestion**: Takes pre-cleaned CSV data.
-    2. **Pattern Mining**: Uses FP-Growth to find items that co-occur.
-    3. **Rule Generation**: Calculates Confidence (probability) and Lift (strength).
-    4. **Recommendation**: Filters rules based on active user selection.
-    """)
