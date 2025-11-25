@@ -1,3 +1,4 @@
+# app_retail.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,6 +13,7 @@ from mlxtend.frequent_patterns import fpgrowth, association_rules
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
+# Page Config
 st.set_page_config(page_title="Retail Intelligence Dashboard", page_icon="📈", layout="wide")
 
 # --------------------------------
@@ -20,7 +22,7 @@ st.set_page_config(page_title="Retail Intelligence Dashboard", page_icon="📈",
 
 @st.cache_data
 def generate_demo_data(n_rows=2000):
-    """Generates synthetic data with meaningful patterns."""
+    """Generates synthetic data for testing."""
     np.random.seed(42)
     products = {
         'PROD_A': 'Wireless Mouse', 'PROD_B': 'Mechanical Keyboard', 
@@ -58,13 +60,13 @@ def generate_demo_data(n_rows=2000):
     return pd.DataFrame(data)
 
 def detect_schema(df: pd.DataFrame) -> dict:
-    """Maps raw column names to a standard schema."""
+    """Maps raw column names to logical schema."""
     cols = {c.lower(): c for c in df.columns}
     schema = {
         "product": None, "invoice": None, "customer": None, "date": None, "amount": None
     }
     
-    # Flexible mapping
+    # Flexible mapping (handles snake_case and CamelCase)
     for cand in ["product_name", "product", "description", "item"]:
         if cand in cols: schema["product"] = cols[cand]; break
         
@@ -77,14 +79,14 @@ def detect_schema(df: pd.DataFrame) -> dict:
     for cand in ["transaction_date", "date", "invoicedate"]:
         if cand in cols: schema["date"] = cols[cand]; break
         
-    for cand in ["final_amount", "total_amount", "amount", "sales"]:
+    for cand in ["final_amount", "total_amount", "amount", "sales", "total"]:
         if cand in cols: schema["amount"] = cols[cand]; break
         
     return schema
 
 def build_transactions(df, schema, grouping_strategy="invoice"):
     """
-    Builds list of baskets based on user-selected grouping strategy.
+    Builds list of baskets based on grouping strategy.
     Strategies: 'invoice' (Invoice/Date), 'customer' (All time history)
     """
     prod = schema["product"]
@@ -96,7 +98,7 @@ def build_transactions(df, schema, grouping_strategy="invoice"):
     group_col = None
     
     if grouping_strategy == "customer":
-        if not cust: return [], "Missing Customer ID column"
+        if not cust: return [], 0.0, "Missing Customer ID column"
         group_col = cust
         
     else: # Default: Invoice or Date
@@ -107,15 +109,12 @@ def build_transactions(df, schema, grouping_strategy="invoice"):
             df['_invoice_id'] = df[cust].astype(str) + "_" + pd.to_datetime(df[date_col]).dt.date.astype(str)
             group_col = '_invoice_id'
         else:
-            return [], "Need Invoice ID or (Customer + Date) to group transactions."
+            return [], 0.0, "Need Invoice ID or (Customer + Date) to group transactions."
 
     # 2. Build Baskets
     # Drop items with no product name
     work_df = df.dropna(subset=[prod]).copy()
     work_df[prod] = work_df[prod].astype(str).str.strip()
-    
-    # Filter out single-item baskets? No, keep them for support calculation, 
-    # but they won't generate rules A->B on their own.
     
     transactions = work_df.groupby(group_col)[prod].apply(
         lambda x: list(set(x)) # Unique items per basket
@@ -123,7 +122,7 @@ def build_transactions(df, schema, grouping_strategy="invoice"):
     
     avg_len = np.mean([len(t) for t in transactions]) if transactions else 0
     
-    return transactions, avg_len
+    return transactions, avg_len, None
 
 def run_mining_pipeline(transactions, min_support, min_metric, metric_name="lift"):
     if not transactions:
@@ -154,30 +153,40 @@ def run_mining_pipeline(transactions, min_support, min_metric, metric_name="lift
         return pd.DataFrame(), pd.DataFrame()
 
 def calculate_rfm(df, schema):
+    """
+    Fixed version using Named Aggregation to avoid ValueError.
+    """
     cust = schema["customer"]
     date_col = schema["date"]
     amt = schema["amount"]
+    inv = schema["invoice"]
     
     if not all([cust, date_col, amt]):
         return pd.DataFrame()
     
     # Ensure Date
+    df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
     now = df[date_col].max() + timedelta(days=1)
     
-    # Calculate RFM
-    # If no invoice col, use date as proxy for frequency
-    freq_col = schema["invoice"] if schema["invoice"] else date_col
-    freq_agg = 'nunique' if schema["invoice"] else 'count'
+    # Define Frequency Source
+    # If no invoice column exists, count the number of transaction dates instead
+    freq_col = inv if inv else date_col
+    freq_agg = 'nunique' if inv else 'count'
 
-    rfm = df.groupby(cust).agg({
-        date_col: lambda x: (now - x.max()).days,
-        freq_col: freq_agg,
-        amt: 'sum'
-    }).reset_index()
+    # --- THE FIX: Use Named Aggregation ---
+    rfm = df.groupby(cust).agg(
+        Recency=(date_col, lambda x: (now - x.max()).days),
+        Frequency=(freq_col, freq_agg),
+        Monetary=(amt, 'sum')
+    ).reset_index()
     
+    # Rename not needed because Named Aggregation handled it, but ensuring explicit consistency:
     rfm.columns = ['CustomerID', 'Recency', 'Frequency', 'Monetary']
-    rfm = rfm[rfm['Monetary'] > 0] # Filter returns
+    
+    # Filter out returns (negative money)
+    rfm = rfm[rfm['Monetary'] > 0]
+    
     return rfm
 
 # --------------------------------
@@ -196,12 +205,15 @@ with st.sidebar:
     else:
         upl = st.file_uploader("Upload CSV", type=['csv'])
         if upl:
-            df = pd.read_csv(upl)
+            try:
+                df = pd.read_csv(upl)
+            except Exception as e:
+                st.error(f"Error reading CSV: {e}")
 
     st.divider()
     st.header("2. Analysis Params")
     
-    # New: Basket Definition Strategy
+    # Basket Definition Strategy (Crucial for sparse data)
     st.markdown("**Basket Definition**")
     basket_mode = st.selectbox(
         "How to group items?",
@@ -212,7 +224,6 @@ with st.sidebar:
     grouping_key = "customer" if "Customer" in basket_mode else "invoice"
 
     st.markdown("**Mining Thresholds**")
-    # Lowered minimum support to 0.001
     min_sup = st.slider("Min Support", 0.001, 0.2, 0.01, format="%.3f")
     metric = st.selectbox("Metric", ["lift", "confidence"])
     thresh = st.slider("Metric Threshold", 0.1, 5.0, 1.0)
@@ -224,7 +235,8 @@ if df.empty:
 # Preprocess
 schema = detect_schema(df)
 if not schema["product"]:
-    st.error("Could not find a 'Product' column. Please check your CSV.")
+    st.error("Could not find a 'Product' column. Please check your CSV column names.")
+    st.write("Columns found:", df.columns.tolist())
     st.stop()
 
 # Tabs
@@ -235,65 +247,68 @@ with t1:
     st.subheader("Association Rules")
     
     # Build Transactions
-    transactions, avg_basket_size = build_transactions(df, schema, grouping_key)
+    transactions, avg_basket_size, err = build_transactions(df, schema, grouping_key)
     
-    col1, col2 = st.columns(2)
-    col1.metric("Total Baskets", len(transactions))
-    col2.metric("Avg Items/Basket", f"{avg_basket_size:.2f}")
-
-    # Warning for sparse data
-    if avg_basket_size < 1.1:
-        st.warning(
-            f"⚠️ **Low Basket Size ({avg_basket_size:.2f}) detected.**\n\n"
-            "Almost all your transactions have only 1 item. Association rules (A → B) cannot be found."
-            "\n👉 **Action:** Switch 'Basket Definition' in the sidebar to **'Same Customer (All History)'**."
-        )
-
-    with st.spinner("Mining patterns..."):
-        fi, rules = run_mining_pipeline(transactions, min_sup, thresh, metric)
-
-    if not rules.empty:
-        st.success(f"Found {len(rules)} rules!")
-        st.dataframe(
-            rules[['antecedents_str', 'consequents_str', 'support', 'confidence', 'lift']]
-            .sort_values('lift', ascending=False)
-            .head(10), 
-            use_container_width=True
-        )
-        
-        # Network Viz
-        try:
-            G = nx.DiGraph()
-            # Limit to top 30 to prevent lag
-            top_rules = rules.sort_values("lift", ascending=False).head(30)
-            
-            for _, r in top_rules.iterrows():
-                G.add_edge(r['antecedents_str'], r['consequents_str'], weight=r['lift'])
-                
-            pos = nx.spring_layout(G, k=0.5, seed=42)
-            
-            edge_x, edge_y = [], []
-            for u, v in G.edges():
-                x0, y0 = pos[u]; x1, y1 = pos[v]
-                edge_x += [x0, x1, None]; edge_y += [y0, y1, None]
-                
-            node_x = [pos[n][0] for n in G.nodes()]
-            node_y = [pos[n][1] for n in G.nodes()]
-            
-            fig = go.Figure([
-                go.Scatter(x=edge_x, y=edge_y, mode='lines', line=dict(width=0.5, color='#888'), hoverinfo='none'),
-                go.Scatter(x=node_x, y=node_y, mode='markers+text', text=list(G.nodes()), 
-                           textposition="top center", marker=dict(size=10, color='royalblue'))
-            ])
-            fig.update_layout(showlegend=False, margin=dict(t=10,b=10,l=10,r=10), 
-                              xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                              yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception as e:
-            st.info(f"Network viz unavailable: {e}")
-            
+    if err:
+        st.error(err)
     else:
-        st.warning("No rules found. Try lowering 'Min Support' or changing 'Basket Definition'.")
+        col1, col2 = st.columns(2)
+        col1.metric("Total Baskets", len(transactions))
+        col2.metric("Avg Items/Basket", f"{avg_basket_size:.2f}")
+
+        # Warning for sparse data
+        if avg_basket_size < 1.1:
+            st.warning(
+                f"⚠️ **Low Basket Size ({avg_basket_size:.2f}) detected.**\n\n"
+                "Almost all your transactions have only 1 item. Association rules (A → B) cannot be found."
+                "\n👉 **Action:** Switch 'Basket Definition' in the sidebar to **'Same Customer (All History)'**."
+            )
+
+        with st.spinner("Mining patterns..."):
+            fi, rules = run_mining_pipeline(transactions, min_sup, thresh, metric)
+
+        if not rules.empty:
+            st.success(f"Found {len(rules)} rules!")
+            st.dataframe(
+                rules[['antecedents_str', 'consequents_str', 'support', 'confidence', 'lift']]
+                .sort_values('lift', ascending=False)
+                .head(10), 
+                use_container_width=True
+            )
+            
+            # Network Viz
+            try:
+                G = nx.DiGraph()
+                # Limit to top 30 to prevent lag
+                top_rules = rules.sort_values("lift", ascending=False).head(30)
+                
+                for _, r in top_rules.iterrows():
+                    G.add_edge(r['antecedents_str'], r['consequents_str'], weight=r['lift'])
+                    
+                pos = nx.spring_layout(G, k=0.5, seed=42)
+                
+                edge_x, edge_y = [], []
+                for u, v in G.edges():
+                    x0, y0 = pos[u]; x1, y1 = pos[v]
+                    edge_x += [x0, x1, None]; edge_y += [y0, y1, None]
+                    
+                node_x = [pos[n][0] for n in G.nodes()]
+                node_y = [pos[n][1] for n in G.nodes()]
+                
+                fig = go.Figure([
+                    go.Scatter(x=edge_x, y=edge_y, mode='lines', line=dict(width=0.5, color='#888'), hoverinfo='none'),
+                    go.Scatter(x=node_x, y=node_y, mode='markers+text', text=list(G.nodes()), 
+                               textposition="top center", marker=dict(size=10, color='royalblue'))
+                ])
+                fig.update_layout(showlegend=False, margin=dict(t=10,b=10,l=10,r=10), 
+                                  xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                                  yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.info(f"Network viz unavailable: {e}")
+                
+        else:
+            st.warning("No rules found. Try lowering 'Min Support' or changing 'Basket Definition'.")
 
 # --- TAB 2: RFM ---
 with t2:
@@ -323,29 +338,32 @@ with t2:
 with t3:
     st.subheader("Smart Recommender")
     
-    all_items = sorted(list(set([i for t in transactions for i in t])))
-    cart = st.multiselect("Simulate Cart (Select Items):", all_items)
-    
-    if cart and not rules.empty:
-        recs = []
-        for _, r in rules.iterrows():
-            # If cart contains the antecedent
-            if set(r['antecedents']).issubset(set(cart)):
-                add_ons = set(r['consequents']) - set(cart)
-                if add_ons:
-                    recs.append({
-                        "Recommendation": ', '.join(add_ons),
-                        "Confidence": r['confidence'],
-                        "Lift": r['lift'],
-                        "Reason": f"Because you picked {', '.join(r['antecedents'])}"
-                    })
+    if 'transactions' in locals() and transactions:
+        all_items = sorted(list(set([i for t in transactions for i in t])))
+        cart = st.multiselect("Simulate Cart (Select Items):", all_items)
         
-        if recs:
-            st.success(f"Found {len(recs)} suggestions!")
-            st.dataframe(pd.DataFrame(recs).sort_values("Lift", ascending=False).drop_duplicates("Recommendation"), use_container_width=True)
+        if cart and 'rules' in locals() and not rules.empty:
+            recs = []
+            for _, r in rules.iterrows():
+                # If cart contains the antecedent
+                if set(r['antecedents']).issubset(set(cart)):
+                    add_ons = set(r['consequents']) - set(cart)
+                    if add_ons:
+                        recs.append({
+                            "Recommendation": ', '.join(add_ons),
+                            "Confidence": r['confidence'],
+                            "Lift": r['lift'],
+                            "Reason": f"Because you picked {', '.join(r['antecedents'])}"
+                        })
+            
+            if recs:
+                st.success(f"Found {len(recs)} suggestions!")
+                st.dataframe(pd.DataFrame(recs).sort_values("Lift", ascending=False).drop_duplicates("Recommendation"), use_container_width=True)
+            else:
+                st.info("No associations found for these specific items.")
+        elif 'rules' in locals() and not rules.empty:
+            st.info("Select items above to see what goes with them.")
         else:
-            st.info("No associations found for these specific items.")
-    elif not rules.empty:
-        st.info("Select items above to see what goes with them.")
+            st.warning("No rules available (Generate them in Tab 1 first).")
     else:
-        st.warning("No rules available (Generate them in Tab 1 first).")
+        st.warning("Load data first.")
