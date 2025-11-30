@@ -29,7 +29,7 @@ st.set_page_config(page_title="Retail Intelligence Dashboard", page_icon="📈",
 # --------------------------------
 
 @st.cache_data
-def generate_demo_data(n_rows=20000):
+def generate_demo_data(n_rows=2000):
     """Generates synthetic data for testing."""
     np.random.seed(42)
     products = {
@@ -316,9 +316,6 @@ def calculate_rfm(df, schema):
 # --------------------------------
 # 2. Main App Logic
 # --------------------------------
-# --------------------------------
-# 2. Main App Logic
-# --------------------------------
 st.title("📈 Retail Intelligence Dashboard")
 
 # Initialize Session State for Data persistence
@@ -329,37 +326,18 @@ if 'enriched' not in st.session_state:
 
 with st.sidebar:
     st.header("1. Data Source")
-    
-    # --- UPDATED DATA SOURCE SELECTION ---
-    source_opt = st.radio("Choose Source", ["Use Demo Data", "Upload CSV", "Load from GitHub URL"], index=0)
+    source_opt = st.radio("Choose Source", ["Use Demo Data", "Upload CSV"], index=1)
     
     if source_opt == "Use Demo Data":
         if st.button("Load Demo Data"):
             st.session_state['df'] = generate_demo_data()
             st.session_state['enriched'] = False
             st.rerun()
-            
-    elif source_opt == "Upload CSV":
+    else:
         upl = st.file_uploader("Upload CSV", type=['csv'])
         if upl is not None:
             st.session_state['df'] = pd.read_csv(upl)
             st.session_state['enriched'] = False
-            
-    elif source_opt == "Load from GitHub URL":
-        github_url = st.text_input("Paste Raw GitHub CSV URL:")
-        st.caption("Example: https://raw.githubusercontent.com/.../data.csv")
-        
-        if st.button("Load from URL") and github_url:
-            with st.spinner("Loading data from URL..."):
-                try:
-                    # pd.read_csv can handle direct URLs
-                    st.session_state['df'] = pd.read_csv(github_url)
-                    st.session_state['enriched'] = False
-                    st.success("Data loaded successfully!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error loading data: Ensure the URL is a RAW CSV link. Details: {e}")
-    # --- END UPDATED DATA SOURCE SELECTION ---
 
     st.divider()
     st.header("2. Analysis Params")
@@ -374,8 +352,14 @@ with st.sidebar:
 df = st.session_state['df']
 
 if df.empty:
-    st.info("👈 Select a data source (Demo, Upload, or GitHub URL) to start.")
+    st.info("👈 Upload data or load demo to start.")
     st.stop()
+
+schema = detect_schema(df)
+if not schema["product"]:
+    st.error("No Product column found in your data. Please upload a file with a product column.")
+    st.stop()
+
 # Tabs
 t1, t2, t3 = st.tabs(["🛍️ Market Basket", "👥 Segmentation", "🤖 Recommender"])
 
