@@ -1,6 +1,10 @@
 # app_retail.py
-# Retail Intelligence Dashboard (v5.0)
-# Updates: Added 'Data Enricher' to fix sparse datasets automatically.
+# Retail Intelligence Dashboard (v5.1 - Hybrid Stable Version)
+# Updates:
+#  - Keeps original 3-tab UI (Market Basket, Segmentation, Recommender)
+#  - FIXED Data Enricher (no dtype errors / safe concatenation)
+#  - Slightly safer rule-mining thresholds when using confidence
+#  - Ready for local use + Streamlit Cloud
 
 import streamlit as st
 import pandas as pd
@@ -67,26 +71,33 @@ def detect_schema(df: pd.DataFrame) -> dict:
     """Maps raw column names to logical schema."""
     cols = {c.lower(): c for c in df.columns}
     schema = {
-        "product": None, "invoice": None, "customer": None, "date": None, "amount": None, "price": None
+        "product": None, "invoice": None, "customer": None,
+        "date": None, "amount": None, "price": None
     }
     
     for cand in ["product_name", "product", "description", "item"]:
-        if cand in cols: schema["product"] = cols[cand]; break
+        if cand in cols:
+            schema["product"] = cols[cand]; break
         
     for cand in ["invoice_id", "invoiceno", "invoice", "transaction_id"]:
-        if cand in cols: schema["invoice"] = cols[cand]; break
+        if cand in cols:
+            schema["invoice"] = cols[cand]; break
         
     for cand in ["customer_id", "customerid", "custid", "id"]:
-        if cand in cols: schema["customer"] = cols[cand]; break
+        if cand in cols:
+            schema["customer"] = cols[cand]; break
         
     for cand in ["transaction_date", "date", "invoicedate"]:
-        if cand in cols: schema["date"] = cols[cand]; break
+        if cand in cols:
+            schema["date"] = cols[cand]; break
         
     for cand in ["final_amount", "total_amount", "amount", "sales", "total"]:
-        if cand in cols: schema["amount"] = cols[cand]; break
+        if cand in cols:
+            schema["amount"] = cols[cand]; break
         
     for cand in ["unit_price", "price", "unitprice"]:
-        if cand in cols: schema["price"] = cols[cand]; break
+        if cand in cols:
+            schema["price"] = cols[cand]; break
         
     return schema
 
@@ -94,6 +105,10 @@ def enrich_data_with_patterns(df):
     """
     Injects synthetic relations into sparse datasets to ensure rules are found.
     Adds patterns like Pasta->Cheese, Cereal->Milk.
+
+    IMPORTANT FIX:
+    - Always builds NEW ROWS as plain dicts (no Series),
+      so pd.DataFrame(new_rows) + concat will NEVER crash with dtype errors.
     """
     df = df.copy()
     schema = detect_schema(df)
@@ -101,7 +116,8 @@ def enrich_data_with_patterns(df):
     cust_col = schema['customer']
     date_col = schema['date']
     
-    if not prod_col: return df
+    if not prod_col:
+        return df
     
     # 1. Define Golden Rules (Antecedent -> Consequent)
     # We look for these products in the dataset. If they exist, we link them.
@@ -128,7 +144,7 @@ def enrich_data_with_patterns(df):
             valid_rules[ant_match] = con_match
 
     if not valid_rules:
-        return df # Can't enrich if we don't recognize products
+        return df  # Can't enrich if we don't recognize products
         
     new_rows = []
     
@@ -141,61 +157,78 @@ def enrich_data_with_patterns(df):
     else:
         avg_prices = {}
 
-    for index, row in df.iterrows():
-        current_prod = str(row[prod_col])
-        
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()  # <-- SAFE copy as dict
+        current_prod = str(row_dict.get(prod_col, ""))
+
         if current_prod in valid_rules:
             target_prod = valid_rules[current_prod]
             
             # 70% chance to add the relation
             if random.random() < 0.70:
-                new_row = row.copy()
+                new_row = row_dict.copy()
                 new_row[prod_col] = target_prod
                 
                 # Update price
-                price = avg_prices.get(target_prod, 5.0)
-                new_row[schema['price']] = round(price, 2) if schema['price'] else 5.0
+                if schema['price']:
+                    price = avg_prices.get(target_prod, 5.0)
+                    new_row[schema['price']] = round(price, 2)
                 if schema['amount']:
                     # Simple logic: 1 unit * price
-                    new_row[schema['amount']] = new_row[schema['price']] 
+                    if schema['price'] and new_row.get(schema['price']) is not None:
+                        new_row[schema['amount']] = new_row[schema['price']]
+                    else:
+                        new_row[schema['amount']] = 5.0
                 
                 new_rows.append(new_row)
     
     # 3. Add Combo Baskets (New transactions purely for support)
     # Adds 20 baskets per rule of just [Item A, Item B]
     if cust_col and date_col:
-        ids = df[cust_col].unique()
-        for ant, con in valid_rules.items():
-            for _ in range(20):
-                cid = random.choice(ids)
-                # Random date in last year
-                dt = datetime.now() - timedelta(days=random.randint(1, 365))
-                
-                # Row A
-                row_a = {cust_col: cid, date_col: dt, prod_col: ant}
-                # Row B
-                row_b = {cust_col: cid, date_col: dt, prod_col: con}
-                
-                # Fill numeric defaults
-                if schema['price']: 
-                    row_a[schema['price']] = avg_prices.get(ant, 5.0)
-                    row_b[schema['price']] = avg_prices.get(con, 5.0)
-                if schema['amount']:
-                    row_a[schema['amount']] = avg_prices.get(ant, 5.0)
-                    row_b[schema['amount']] = avg_prices.get(con, 5.0)
-                
-                # Copy other cols from first row of df to avoid NaN issues
-                base_row = df.iloc[0].to_dict()
-                base_row.update(row_a)
-                new_rows.append(base_row)
-                
-                base_row_b = df.iloc[0].to_dict()
-                base_row_b.update(row_b)
-                new_rows.append(base_row_b)
+        ids = df[cust_col].dropna().unique()
+        if len(ids) > 0:
+            for ant, con in valid_rules.items():
+                for _ in range(20):
+                    cid = random.choice(ids.tolist())
+                    # Random date in last year
+                    dt = datetime.now() - timedelta(days=random.randint(1, 365))
+                    
+                    # Base template row from first row of df
+                    base = df.iloc[0].to_dict()
+                    
+                    # Row A
+                    row_a = base.copy()
+                    row_a[cust_col] = cid
+                    row_a[date_col] = dt
+                    row_a[prod_col] = ant
+                    
+                    # Row B
+                    row_b = base.copy()
+                    row_b[cust_col] = cid
+                    row_b[date_col] = dt
+                    row_b[prod_col] = con
+                    
+                    # Fill numeric defaults
+                    if schema['price']:
+                        row_a[schema['price']] = avg_prices.get(ant, 5.0)
+                        row_b[schema['price']] = avg_prices.get(con, 5.0)
+                    if schema['amount']:
+                        row_a[schema['amount']] = avg_prices.get(ant, 5.0)
+                        row_b[schema['amount']] = avg_prices.get(con, 5.0)
+                    
+                    new_rows.append(row_a)
+                    new_rows.append(row_b)
 
-    # Combine
+    # Combine safely
+    if not new_rows:
+        return df
+
+    enriched_df = pd.DataFrame(new_rows)
+    # Align columns (any missing columns get NaN)
+    enriched_df = enriched_df.reindex(columns=df.columns, fill_value=np.nan)
+
     st.toast(f"Enriched data with {len(new_rows)} new interactions!", icon="🪄")
-    return pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+    return pd.concat([df, enriched_df], ignore_index=True)
 
 def build_transactions(df, schema, grouping_strategy="invoice"):
     prod = schema["product"]
@@ -205,11 +238,15 @@ def build_transactions(df, schema, grouping_strategy="invoice"):
     
     group_col = None
     if grouping_strategy == "customer":
-        if not cust: return [], 0.0, "Missing Customer ID"
+        if not cust: 
+            return [], 0.0, "Missing Customer ID"
         group_col = cust
     else:
-        if inv: group_col = inv
+        if inv:
+            group_col = inv
         elif cust and date_col:
+            # Fallback: customer + date as pseudo-invoice
+            df = df.copy()
             df['_invoice_id'] = df[cust].astype(str) + "_" + pd.to_datetime(df[date_col]).dt.date.astype(str)
             group_col = '_invoice_id'
         else:
@@ -223,19 +260,33 @@ def build_transactions(df, schema, grouping_strategy="invoice"):
     return transactions, avg_len, None
 
 def run_mining_pipeline(transactions, min_support, min_metric, metric_name="lift"):
-    if not transactions: return pd.DataFrame(), pd.DataFrame()
+    """
+    Run FP-Growth + association_rules with safety around threshold values.
+    If metric_name is 'confidence', clamp min_metric to [0, 1].
+    If metric_name is 'lift', clamp min_metric to [1, +inf).
+    """
+    if not transactions:
+        return pd.DataFrame(), pd.DataFrame()
+    
+    # Clamp metric thresholds to valid ranges
+    if metric_name == "confidence":
+        min_metric = max(0.0, min(min_metric, 1.0))
+    elif metric_name == "lift":
+        min_metric = max(min_metric, 1.0)
+    
     te = TransactionEncoder()
     try:
         te_ary = te.fit(transactions).transform(transactions)
         df_encoded = pd.DataFrame(te_ary, columns=te.columns_)
         fi = fpgrowth(df_encoded, min_support=min_support, use_colnames=True)
-        if fi.empty: return pd.DataFrame(), pd.DataFrame()
+        if fi.empty:
+            return pd.DataFrame(), pd.DataFrame()
         rules = association_rules(fi, metric=metric_name, min_threshold=min_metric)
         if not rules.empty:
             rules["antecedents_str"] = rules["antecedents"].apply(lambda x: ', '.join(list(x)))
             rules["consequents_str"] = rules["consequents"].apply(lambda x: ', '.join(list(x)))
         return fi, rules
-    except Exception as e:
+    except Exception:
         return pd.DataFrame(), pd.DataFrame()
 
 def calculate_rfm(df, schema):
@@ -244,7 +295,8 @@ def calculate_rfm(df, schema):
     amt = schema["amount"]
     inv = schema["invoice"]
     
-    if not all([cust, date_col, amt]): return pd.DataFrame()
+    if not all([cust, date_col, amt]):
+        return pd.DataFrame()
     
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
@@ -283,9 +335,9 @@ with st.sidebar:
             st.rerun()
     else:
         upl = st.file_uploader("Upload CSV", type=['csv'])
-        if upl:
-            # Load only if new file
+        if upl is not None:
             st.session_state['df'] = pd.read_csv(upl)
+            st.session_state['enriched'] = False
 
     st.divider()
     st.header("2. Analysis Params")
@@ -294,17 +346,18 @@ with st.sidebar:
     
     min_sup = st.slider("Min Support", 0.001, 0.2, 0.01)
     metric = st.selectbox("Metric", ["lift", "confidence"])
+    # Threshold slider remains 0.1–5.0, but we clamp inside run_mining_pipeline
     thresh = st.slider("Threshold", 0.1, 5.0, 1.0)
 
 df = st.session_state['df']
 
 if df.empty:
-    st.info("👈 Upload data to start.")
+    st.info("👈 Upload data or load demo to start.")
     st.stop()
 
 schema = detect_schema(df)
 if not schema["product"]:
-    st.error("No Product column found.")
+    st.error("No Product column found in your data. Please upload a file with a product column.")
     st.stop()
 
 # Tabs
@@ -320,6 +373,10 @@ with t1:
     col1, col2, col3 = st.columns(3)
     col1.metric("Total Baskets", len(transactions))
     col2.metric("Avg Basket Size", f"{avg_len:.2f}")
+    if err:
+        col3.error(err)
+    else:
+        col3.success("Basket building OK")
     
     # 2. Run Mining
     fi, rules = run_mining_pipeline(transactions, min_sup, thresh, metric)
@@ -334,7 +391,7 @@ with t1:
         st.info("Your data might be too sparse (items rarely bought together).")
         
         if st.button("✨ Inject Synthetic Patterns & Retry"):
-            with st.spinner("Injecting relations (Pasta->Cheese, Cereal->Milk)..."):
+            with st.spinner("Injecting relations (Pasta->Cheese, Cereal->Milk, etc.)..."):
                 new_df = enrich_data_with_patterns(df)
                 st.session_state['df'] = new_df
                 st.session_state['enriched'] = True
@@ -344,12 +401,22 @@ with t1:
         # Success State
         col3.success(f"{len(rules)} Rules Found!")
         
-        st.dataframe(rules[['antecedents_str', 'consequents_str', 'support', 'confidence', 'lift']].sort_values('lift', ascending=False).head(10), use_container_width=True)
+        st.dataframe(
+            rules[['antecedents_str', 'consequents_str', 'support', 'confidence', 'lift']]
+            .sort_values('lift', ascending=False)
+            .head(10),
+            use_container_width=True
+        )
         
         # Download Button for Enriched Data
         if st.session_state.get('enriched'):
             csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Enriched CSV", csv, "grocery_enriched.csv", "text/csv")
+            st.download_button(
+                "📥 Download Enriched CSV",
+                csv,
+                "grocery_enriched.csv",
+                "text/csv"
+            )
 
         # Network Viz
         try:
@@ -367,30 +434,61 @@ with t1:
             node_y = [pos[n][1] for n in G.nodes()]
             
             fig = go.Figure([
-                go.Scatter(x=edge_x, y=edge_y, mode='lines', line=dict(width=0.5, color='#888'), hoverinfo='none'),
-                go.Scatter(x=node_x, y=node_y, mode='markers+text', text=list(G.nodes()), textposition="top center", marker=dict(size=12, color='royalblue'))
+                go.Scatter(
+                    x=edge_x, y=edge_y,
+                    mode='lines',
+                    line=dict(width=0.5, color='#888'),
+                    hoverinfo='none'
+                ),
+                go.Scatter(
+                    x=node_x, y=node_y,
+                    mode='markers+text',
+                    text=list(G.nodes()),
+                    textposition="top center",
+                    marker=dict(size=12, color='royalblue')
+                )
             ])
-            fig.update_layout(showlegend=False, margin=dict(t=0,b=0,l=0,r=0), xaxis=dict(visible=False), yaxis=dict(visible=False))
+            fig.update_layout(
+                showlegend=False,
+                margin=dict(t=0,b=0,l=0,r=0),
+                xaxis=dict(visible=False),
+                yaxis=dict(visible=False)
+            )
             st.plotly_chart(fig, use_container_width=True)
-        except Exception: pass
+        except Exception:
+            pass
 
-# --- TAB 2: RFM ---
+# --- TAB 2: RFM / Segmentation ---
 with t2:
-    st.subheader("Customer Segmentation")
+    st.subheader("Customer Segmentation (RFM + KMeans)")
     rfm = calculate_rfm(df, schema)
     if not rfm.empty:
         scaler = StandardScaler()
         rfm_scaled = scaler.fit_transform(rfm[['Recency', 'Frequency', 'Monetary']])
         k = st.slider("K Clusters", 2, 6, 3)
-        rfm['Cluster'] = KMeans(n_clusters=k, random_state=42).fit_predict(rfm_scaled)
+        rfm['Cluster'] = KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(rfm_scaled)
         
         c1, c2 = st.columns([1, 2])
-        c1.dataframe(rfm.groupby('Cluster')[['Recency','Frequency','Monetary']].mean().round(1))
-        c2.plotly_chart(px.scatter_3d(rfm, x='Recency', y='Frequency', z='Monetary', color='Cluster', opacity=0.6), use_container_width=True)
+        c1.dataframe(
+            rfm.groupby('Cluster')[['Recency','Frequency','Monetary']].mean().round(1),
+            use_container_width=True
+        )
+        c2.plotly_chart(
+            px.scatter_3d(
+                rfm,
+                x='Recency', y='Frequency', z='Monetary',
+                color='Cluster', opacity=0.6,
+                title="Customer Clusters in RFM Space"
+            ),
+            use_container_width=True
+        )
+    else:
+        st.info("Not enough data or missing columns to compute RFM (need customer, date, and amount).")
 
 # --- TAB 3: Recommender ---
 with t3:
     st.subheader("Smart Recommender")
+    # We reuse 'transactions' and 'rules' from Tab 1
     if 'transactions' in locals() and transactions:
         all_items = sorted(list(set([i for t in transactions for i in t])))
         cart = st.multiselect("Cart Items:", all_items)
@@ -401,10 +499,16 @@ with t3:
                 if set(r['antecedents']).issubset(set(cart)):
                     add_ons = set(r['consequents']) - set(cart)
                     if add_ons:
-                        recs.append({"Item": ', '.join(add_ons), "Lift": r['lift']})
+                        recs.append({"Item": ', '.join(sorted(add_ons)), "Lift": r['lift']})
             if recs:
-                st.dataframe(pd.DataFrame(recs).sort_values("Lift", ascending=False).drop_duplicates("Item"), use_container_width=True)
+                rec_df = pd.DataFrame(recs).sort_values("Lift", ascending=False)
+                rec_df = rec_df.drop_duplicates("Item")
+                st.dataframe(rec_df, use_container_width=True)
             else:
-                st.info("No add-ons found.")
+                st.info("No add-ons found for this cart based on current rules.")
         elif not rules.empty:
-            st.info("Select items to see recommendations.")
+            st.info("Select items in the cart above to see recommendations.")
+        else:
+            st.info("No rules available. Please adjust support/metric or enrich the data in the Market Basket tab.")
+    else:
+        st.info("No transactions built yet. Please check the Market Basket tab first.")
