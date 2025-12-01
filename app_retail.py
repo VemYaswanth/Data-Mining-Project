@@ -191,7 +191,7 @@ with st.sidebar:
 # --- Main Logic ---
 
 if loaded_df is None:
-    st.warning("👈 Please upload 'grocery_chain_data.csv' to start.")
+    st.warning("👈 Please upload Dataset to start.")
     st.stop()
 
 # Detect Schema
@@ -214,7 +214,7 @@ if schema['category'] and schema['amount']:
     st.plotly_chart(fig, use_container_width=True)
 
 # Tabs
-tab1, tab2, tab3 = st.tabs(["🛍️ Market Basket", "👥 Segmentation", "📝 Data View"])
+tab1, tab2, tab3 = st.tabs(["🛍️ Market Basket", "👥 Segmentation", "🔍 Recommender"])
 
 # --- TAB 1: Market Basket ---
 with tab1:
