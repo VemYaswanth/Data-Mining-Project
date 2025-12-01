@@ -1,514 +1,337 @@
 # app_retail.py
-# Retail Intelligence Dashboard (v5.1 - Hybrid Stable Version)
-# Updates:
-#  - Keeps original 3-tab UI (Market Basket, Segmentation, Recommender)
-#  - FIXED Data Enricher (no dtype errors / safe concatenation)
-#  - Slightly safer rule-mining thresholds when using confidence
-#  - Ready for local use + Streamlit Cloud
+# Retail Intelligence Dashboard
+# Designed for: grocery_chain_data.csv
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-import random
 import plotly.express as px
 import plotly.graph_objects as go
 import networkx as nx
+import os
+from datetime import datetime, timedelta
+import random
 
-# ML & Mining Libraries
+# ML Libraries
 from mlxtend.preprocessing import TransactionEncoder
 from mlxtend.frequent_patterns import fpgrowth, association_rules
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
-# Page Config
-st.set_page_config(page_title="Retail Intelligence Dashboard", page_icon="📈", layout="wide")
+# ------------------------------------------------------------------------------
+# 1. Page Configuration
+# ------------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Retail Intelligence Dashboard",
+    page_icon="🛒",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# --------------------------------
-# 1. Helper Functions
-# --------------------------------
-
-@st.cache_data
-def generate_demo_data(n_rows=2000):
-    """Generates synthetic data for testing."""
-    np.random.seed(42)
-    products = {
-        'PROD_A': 'Wireless Mouse', 'PROD_B': 'Mechanical Keyboard', 
-        'PROD_C': 'USB-C Cable', 'PROD_D': 'Monitor Stand', 
-        'PROD_E': 'Webcam HD', 'PROD_F': 'Gaming Headset'
-    }
-    prod_codes = list(products.keys())
-    cust_ids = [f"CUST_{i:03d}" for i in range(1, 51)]
-    
-    data = []
-    invoice_id = 1000
-    start_date = datetime.now() - timedelta(days=180)
-    
-    for _ in range(n_rows // 3):
-        invoice_id += 1
-        date = start_date + timedelta(days=np.random.randint(0, 180))
-        customer = np.random.choice(cust_ids)
-        
-        # Enforce multi-item baskets for demo
-        basket_size = np.random.randint(2, 6) 
-        basket_items = np.random.choice(prod_codes, basket_size, replace=False)
-        
-        for p_code in basket_items:
-            qty = np.random.randint(1, 4)
-            price = np.random.uniform(10, 100)
-            data.append({
-                "invoice_id": str(invoice_id),
-                "product_name": products[p_code],
-                "quantity": qty,
-                "transaction_date": date,
-                "final_amount": round(qty * price, 2),
-                "customer_id": customer
-            })
-            
-    return pd.DataFrame(data)
+# ------------------------------------------------------------------------------
+# 2. Helper Functions
+# ------------------------------------------------------------------------------
 
 def detect_schema(df: pd.DataFrame) -> dict:
-    """Maps raw column names to logical schema."""
+    """Auto-detects column names based on your CSV structure."""
     cols = {c.lower(): c for c in df.columns}
     schema = {
         "product": None, "invoice": None, "customer": None,
-        "date": None, "amount": None, "price": None
+        "date": None, "amount": None, "category": None
     }
     
-    for cand in ["product_name", "product", "description", "item"]:
-        if cand in cols:
-            schema["product"] = cols[cand]; break
-        
-    for cand in ["invoice_id", "invoiceno", "invoice", "transaction_id"]:
-        if cand in cols:
-            schema["invoice"] = cols[cand]; break
-        
-    for cand in ["customer_id", "customerid", "custid", "id"]:
-        if cand in cols:
-            schema["customer"] = cols[cand]; break
-        
-    for cand in ["transaction_date", "date", "invoicedate"]:
-        if cand in cols:
-            schema["date"] = cols[cand]; break
-        
-    for cand in ["final_amount", "total_amount", "amount", "sales", "total"]:
-        if cand in cols:
-            schema["amount"] = cols[cand]; break
-        
-    for cand in ["unit_price", "price", "unitprice"]:
-        if cand in cols:
-            schema["price"] = cols[cand]; break
-        
+    # Mappings based on your file + fallbacks
+    mappings = {
+        "product": ["product_name", "product", "item"],
+        "invoice": ["invoice_id", "transaction_id"], # Your file might not have this, which is fine
+        "customer": ["customer_id", "cust_id"],
+        "date": ["transaction_date", "date"],
+        "amount": ["final_amount", "total_amount", "sales"],
+        "category": ["aisle", "category", "department"]
+    }
+
+    for key, candidates in mappings.items():
+        for cand in candidates:
+            if cand in cols:
+                schema[key] = cols[cand]
+                break
     return schema
+
+def build_transactions(df, schema):
+    """
+    Groups products into baskets. 
+    Since your file lacks Invoice ID, we group by Customer + Date.
+    """
+    prod = schema["product"]
+    cust = schema["customer"]
+    date_col = schema["date"]
+    
+    # Filter out returns (negative amounts) if possible
+    if schema['amount']:
+        df = df[df[schema['amount']] > 0].copy()
+    else:
+        df = df.copy()
+
+    # Create a Basket ID
+    if schema['invoice']:
+        group_col = schema['invoice']
+    elif cust and date_col:
+        # Create artificial Invoice ID: CustomerID_Date
+        # Ensure date is string format yyyy-mm-dd
+        df['temp_date_str'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
+        df['_basket_id'] = df[cust].astype(str) + "_" + df['temp_date_str']
+        group_col = '_basket_id'
+    else:
+        return [], "Could not group data. Need 'Invoice ID' OR 'Customer ID' + 'Date'."
+
+    # Grouping logic
+    df_clean = df.dropna(subset=[prod])
+    transactions = df_clean.groupby(group_col)[prod].apply(list).tolist()
+    return transactions, None
 
 def enrich_data_with_patterns(df):
     """
-    Injects synthetic relations into sparse datasets to ensure rules are found.
-    Adds patterns like Pasta->Cheese, Cereal->Milk.
-
-    IMPORTANT FIX:
-    - Always builds NEW ROWS as plain dicts (no Series),
-      so pd.DataFrame(new_rows) + concat will NEVER crash with dtype errors.
+    AI Data Fixer: Injects logical grocery patterns if the raw data is too random.
+    Tailored for: Cereal, Milk, Pasta, Cheese, Chicken, Rice.
     """
     df = df.copy()
     schema = detect_schema(df)
     prod_col = schema['product']
-    cust_col = schema['customer']
-    date_col = schema['date']
     
-    if not prod_col:
-        return df
-    
-    # 1. Define Golden Rules (Antecedent -> Consequent)
-    # We look for these products in the dataset. If they exist, we link them.
-    known_rules = {
-        'Pasta': 'Cheese',
+    if not prod_col: return df
+
+    # Specific pairs for YOUR dataset inventory
+    rules_logic = {
         'Cereal': 'Milk',
+        'Pasta': 'Cheese',
         'Ground Beef': 'Onions',
-        'Bananas': 'Yogurt',
         'Chicken Breast': 'Rice',
-        'Shampoo': 'Conditioner',
-        'Chips': 'Salsa'
+        'Wheat Flour': 'Eggs',
+        'Peanut Butter': 'Jelly', # If present
+        'Tortilla Chips': 'Salsa' # If present
     }
     
-    # Filter rules to only products that actually exist in the data (fuzzy match)
+    # 1. Identify which products actually exist in the file
     unique_prods = df[prod_col].astype(str).unique()
     valid_rules = {}
     
-    # Simple fuzzy matcher
-    for ant, con in known_rules.items():
-        # Find closest match in data
+    for ant, con in rules_logic.items():
+        # Fuzzy match (e.g., 'Pasta' matches 'Whole Wheat Pasta')
         ant_match = next((p for p in unique_prods if ant.lower() in p.lower()), None)
         con_match = next((p for p in unique_prods if con.lower() in p.lower()), None)
         if ant_match and con_match:
             valid_rules[ant_match] = con_match
 
-    if not valid_rules:
-        return df  # Can't enrich if we don't recognize products
-        
-    new_rows = []
-    
-    # 2. Iterate and Inject
-    # We iterate rows. If we see Antecedent, we add Consequent with 70% probability.
-    
-    # Calculate average prices for realistic injection
-    if schema['price']:
-        avg_prices = df.groupby(prod_col)[schema['price']].mean().to_dict()
-    else:
-        avg_prices = {}
+    if not valid_rules: return df # Nothing to enrich
 
+    # 2. Inject patterns
+    new_rows = []
+    # Get average prices to fill gaps
+    avg_price = df[schema['amount']].mean() if schema['amount'] else 10.0
+    
     for _, row in df.iterrows():
-        row_dict = row.to_dict()  # <-- SAFE copy as dict
+        # Safe dictionary copy
+        row_dict = row.to_dict()
         current_prod = str(row_dict.get(prod_col, ""))
 
         if current_prod in valid_rules:
-            target_prod = valid_rules[current_prod]
-            
-            # 70% chance to add the relation
-            if random.random() < 0.70:
+            # 60% chance to add the complementary item
+            if random.random() < 0.60:
+                target = valid_rules[current_prod]
                 new_row = row_dict.copy()
-                new_row[prod_col] = target_prod
+                new_row[prod_col] = target
                 
-                # Update price
-                if schema['price']:
-                    price = avg_prices.get(target_prod, 5.0)
-                    new_row[schema['price']] = round(price, 2)
-                if schema['amount']:
-                    # Simple logic: 1 unit * price
-                    if schema['price'] and new_row.get(schema['price']) is not None:
-                        new_row[schema['amount']] = new_row[schema['price']]
-                    else:
-                        new_row[schema['amount']] = 5.0
+                # Update amounts to be realistic (fake price)
+                if schema['amount']: 
+                    new_row[schema['amount']] = round(avg_price, 2)
                 
                 new_rows.append(new_row)
-    
-    # 3. Add Combo Baskets (New transactions purely for support)
-    # Adds 20 baskets per rule of just [Item A, Item B]
-    if cust_col and date_col:
-        ids = df[cust_col].dropna().unique()
-        if len(ids) > 0:
-            for ant, con in valid_rules.items():
-                for _ in range(20):
-                    cid = random.choice(ids.tolist())
-                    # Random date in last year
-                    dt = datetime.now() - timedelta(days=random.randint(1, 365))
-                    
-                    # Base template row from first row of df
-                    base = df.iloc[0].to_dict()
-                    
-                    # Row A
-                    row_a = base.copy()
-                    row_a[cust_col] = cid
-                    row_a[date_col] = dt
-                    row_a[prod_col] = ant
-                    
-                    # Row B
-                    row_b = base.copy()
-                    row_b[cust_col] = cid
-                    row_b[date_col] = dt
-                    row_b[prod_col] = con
-                    
-                    # Fill numeric defaults
-                    if schema['price']:
-                        row_a[schema['price']] = avg_prices.get(ant, 5.0)
-                        row_b[schema['price']] = avg_prices.get(con, 5.0)
-                    if schema['amount']:
-                        row_a[schema['amount']] = avg_prices.get(ant, 5.0)
-                        row_b[schema['amount']] = avg_prices.get(con, 5.0)
-                    
-                    new_rows.append(row_a)
-                    new_rows.append(row_b)
 
-    # Combine safely
-    if not new_rows:
-        return df
+    if new_rows:
+        return pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+    return df
 
-    enriched_df = pd.DataFrame(new_rows)
-    # Align columns (any missing columns get NaN)
-    enriched_df = enriched_df.reindex(columns=df.columns, fill_value=np.nan)
+# ------------------------------------------------------------------------------
+# 3. Main App Layout
+# ------------------------------------------------------------------------------
 
-    st.toast(f"Enriched data with {len(new_rows)} new interactions!", icon="🪄")
-    return pd.concat([df, enriched_df], ignore_index=True)
+st.title("🥦 Grocery Chain Analytics Dashboard")
+st.markdown("**Interactive Final Report** | Analyzing Sales, Baskets, and Customer Segments")
 
-def build_transactions(df, schema, grouping_strategy="invoice"):
-    prod = schema["product"]
-    inv = schema["invoice"]
-    cust = schema["customer"]
-    date_col = schema["date"]
-    
-    group_col = None
-    if grouping_strategy == "customer":
-        if not cust: 
-            return [], 0.0, "Missing Customer ID"
-        group_col = cust
-    else:
-        if inv:
-            group_col = inv
-        elif cust and date_col:
-            # Fallback: customer + date as pseudo-invoice
-            df = df.copy()
-            df['_invoice_id'] = df[cust].astype(str) + "_" + pd.to_datetime(df[date_col]).dt.date.astype(str)
-            group_col = '_invoice_id'
-        else:
-            return [], 0.0, "Need Invoice or Customer+Date"
-
-    work_df = df.dropna(subset=[prod]).copy()
-    work_df[prod] = work_df[prod].astype(str).str.strip()
-    
-    transactions = work_df.groupby(group_col)[prod].apply(lambda x: list(set(x))).tolist()
-    avg_len = np.mean([len(t) for t in transactions]) if transactions else 0
-    return transactions, avg_len, None
-
-def run_mining_pipeline(transactions, min_support, min_metric, metric_name="lift"):
-    """
-    Run FP-Growth + association_rules with safety around threshold values.
-    If metric_name is 'confidence', clamp min_metric to [0, 1].
-    If metric_name is 'lift', clamp min_metric to [1, +inf).
-    """
-    if not transactions:
-        return pd.DataFrame(), pd.DataFrame()
-    
-    # Clamp metric thresholds to valid ranges
-    if metric_name == "confidence":
-        min_metric = max(0.0, min(min_metric, 1.0))
-    elif metric_name == "lift":
-        min_metric = max(min_metric, 1.0)
-    
-    te = TransactionEncoder()
-    try:
-        te_ary = te.fit(transactions).transform(transactions)
-        df_encoded = pd.DataFrame(te_ary, columns=te.columns_)
-        fi = fpgrowth(df_encoded, min_support=min_support, use_colnames=True)
-        if fi.empty:
-            return pd.DataFrame(), pd.DataFrame()
-        rules = association_rules(fi, metric=metric_name, min_threshold=min_metric)
-        if not rules.empty:
-            rules["antecedents_str"] = rules["antecedents"].apply(lambda x: ', '.join(list(x)))
-            rules["consequents_str"] = rules["consequents"].apply(lambda x: ', '.join(list(x)))
-        return fi, rules
-    except Exception:
-        return pd.DataFrame(), pd.DataFrame()
-
-def calculate_rfm(df, schema):
-    cust = schema["customer"]
-    date_col = schema["date"]
-    amt = schema["amount"]
-    inv = schema["invoice"]
-    
-    if not all([cust, date_col, amt]):
-        return pd.DataFrame()
-    
-    df = df.copy()
-    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-    now = df[date_col].max() + timedelta(days=1)
-    
-    freq_col = inv if inv else date_col
-    freq_agg = 'nunique' if inv else 'count'
-
-    rfm = df.groupby(cust).agg(
-        Recency=(date_col, lambda x: (now - x.max()).days),
-        Frequency=(freq_col, freq_agg),
-        Monetary=(amt, 'sum')
-    ).reset_index()
-    
-    return rfm[rfm['Monetary'] > 0]
-
-# --------------------------------
-# 2. Main App Logic
-# --------------------------------
-st.title("📈 Retail Intelligence Dashboard")
-
-# Initialize Session State for Data persistence
-if 'df' not in st.session_state:
-    st.session_state['df'] = pd.DataFrame()
-if 'enriched' not in st.session_state:
-    st.session_state['enriched'] = False
-
+# --- Sidebar ---
 with st.sidebar:
     st.header("1. Data Source")
-    source_opt = st.radio("Choose Source", ["Use Demo Data", "Upload CSV"], index=1)
     
-    if source_opt == "Use Demo Data":
-        if st.button("Load Demo Data"):
-            st.session_state['df'] = generate_demo_data()
-            st.session_state['enriched'] = False
-            st.rerun()
-    else:
-        upl = st.file_uploader("Upload CSV", type=['csv'])
-        if upl is not None:
-            st.session_state['df'] = pd.read_csv(upl)
-            st.session_state['enriched'] = False
+    # Auto-load logic
+    default_file = "grocery_chain_data.csv"
+    loaded_df = None
+    
+    # File Uploader
+    uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
+    
+    if uploaded_file:
+        loaded_df = pd.read_csv(uploaded_file)
+        st.success("File Uploaded!")
+    elif os.path.exists(default_file):
+        loaded_df = pd.read_csv(default_file)
+        st.info(f"Using local file: {default_file}")
+    
+    if loaded_df is not None:
+        # Preprocessing: Convert Date
+        schema = detect_schema(loaded_df)
+        if schema['date']:
+            loaded_df[schema['date']] = pd.to_datetime(loaded_df[schema['date']], errors='coerce')
 
     st.divider()
-    st.header("2. Analysis Params")
-    basket_mode = st.selectbox("Group By", ["Same Invoice/Date", "Same Customer (History)"])
-    grouping_key = "customer" if "Customer" in basket_mode else "invoice"
-    
-    min_sup = st.slider("Min Support", 0.001, 0.2, 0.01)
-    metric = st.selectbox("Metric", ["lift", "confidence"])
-    # Threshold slider remains 0.1–5.0, but we clamp inside run_mining_pipeline
-    thresh = st.slider("Threshold", 0.1, 5.0, 1.0)
+    st.header("2. Analysis Settings")
+    min_sup = st.slider("Min Support", 0.001, 0.2, 0.01, help="Min % of baskets containing the item")
+    metric = st.selectbox("Metric", ["lift", "confidence"], index=0)
+    thresh = st.slider("Threshold", 0.5, 10.0, 1.0)
 
-df = st.session_state['df']
+# --- Main Logic ---
 
-if df.empty:
-    st.info("👈 Upload data or load demo to start.")
+if loaded_df is None:
+    st.warning("👈 Please upload 'grocery_chain_data.csv' to start.")
     st.stop()
 
+# Detect Schema
+df = loaded_df
 schema = detect_schema(df)
-if not schema["product"]:
-    st.error("No Product column found in your data. Please upload a file with a product column.")
-    st.stop()
+
+# Top Level KPIs
+kpi1, kpi2, kpi3 = st.columns(3)
+kpi1.metric("Total Transactions", len(df))
+if schema['amount']:
+    kpi2.metric("Total Revenue", f"${df[schema['amount']].sum():,.0f}")
+if schema['customer']:
+    kpi3.metric("Unique Customers", df[schema['customer']].nunique())
+
+# Overview Chart (Sales by Aisle)
+if schema['category'] and schema['amount']:
+    st.subheader("Sales by Aisle")
+    aisle_sales = df.groupby(schema['category'])[schema['amount']].sum().reset_index().sort_values(schema['amount'], ascending=False)
+    fig = px.bar(aisle_sales, x=schema['category'], y=schema['amount'], color=schema['amount'], color_continuous_scale="Greens")
+    st.plotly_chart(fig, use_container_width=True)
 
 # Tabs
-t1, t2, t3 = st.tabs(["🛍️ Market Basket", "👥 Segmentation", "🤖 Recommender"])
+tab1, tab2, tab3 = st.tabs(["🛍️ Market Basket", "👥 Segmentation", "📝 Data View"])
 
 # --- TAB 1: Market Basket ---
-with t1:
-    st.subheader("Association Rules")
+with tab1:
+    st.subheader("Association Rules (Product Affinities)")
     
-    # 1. Build Transactions
-    transactions, avg_len, err = build_transactions(df, schema, grouping_key)
+    transactions, err = build_transactions(df, schema)
     
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Baskets", len(transactions))
-    col2.metric("Avg Basket Size", f"{avg_len:.2f}")
     if err:
-        col3.error(err)
+        st.error(err)
     else:
-        col3.success("Basket building OK")
-    
-    # 2. Run Mining
-    fi, rules = run_mining_pipeline(transactions, min_sup, thresh, metric)
-    
-    # 3. Handle No Rules / Sparse Data
-    if rules.empty:
-        st.warning(f"No rules found with Support={min_sup} & {metric}={thresh}.")
+        # Run Apriori / FPGrowth
+        te = TransactionEncoder()
+        te_ary = te.fit(transactions).transform(transactions)
+        df_enc = pd.DataFrame(te_ary, columns=te.columns_)
         
-        # --- THE ENRICHMENT FEATURE ---
-        st.divider()
-        st.markdown("### 🤖 AI Data Fixer")
-        st.info("Your data might be too sparse (items rarely bought together).")
+        frequent = fpgrowth(df_enc, min_support=min_sup, use_colnames=True)
         
-        if st.button("✨ Inject Synthetic Patterns & Retry"):
-            with st.spinner("Injecting relations (Pasta->Cheese, Cereal->Milk, etc.)..."):
-                new_df = enrich_data_with_patterns(df)
-                st.session_state['df'] = new_df
-                st.session_state['enriched'] = True
-                st.rerun()
+        if frequent.empty:
+            st.warning("No patterns found! Your data might be sparse.")
+            st.markdown("#### 🤖 AI Data Enhancer")
+            st.write("Click below to inject common grocery patterns (e.g., Cereal -> Milk) into the dataset for the demo.")
+            
+            if st.button("✨ Enrich Data & Retry"):
+                with st.spinner("Injecting synthetic patterns..."):
+                    new_df = enrich_data_with_patterns(df)
+                    st.session_state['enriched_df'] = new_df # Store for persistence
+                    # In a real app we would rerun, here we just show success
+                    st.success("Data enriched! Please adjust the sliders slightly to trigger a refresh with new data (or reload the app using the new CSV below).")
+                    
+                    # Offer download of enriched data
+                    csv = new_df.to_csv(index=False).encode('utf-8')
+                    st.download_button("Download Enriched CSV", csv, "grocery_enriched.csv", "text/csv")
+        else:
+            rules = association_rules(frequent, metric=metric, min_threshold=thresh)
+            
+            if not rules.empty:
+                # Stringify for display
+                rules['antecedents'] = rules['antecedents'].apply(lambda x: list(x)[0])
+                rules['consequents'] = rules['consequents'].apply(lambda x: list(x)[0])
                 
-    else:
-        # Success State
-        col3.success(f"{len(rules)} Rules Found!")
-        
-        st.dataframe(
-            rules[['antecedents_str', 'consequents_str', 'support', 'confidence', 'lift']]
-            .sort_values('lift', ascending=False)
-            .head(10),
-            use_container_width=True
-        )
-        
-        # Download Button for Enriched Data
-        if st.session_state.get('enriched'):
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                "📥 Download Enriched CSV",
-                csv,
-                "grocery_enriched.csv",
-                "text/csv"
-            )
-
-        # Network Viz
-        try:
-            G = nx.DiGraph()
-            for _, r in rules.sort_values("lift", ascending=False).head(30).iterrows():
-                G.add_edge(r['antecedents_str'], r['consequents_str'], weight=r['lift'])
-            
-            pos = nx.spring_layout(G, k=0.6, seed=42)
-            edge_x, edge_y = [], []
-            for u, v in G.edges():
-                x0, y0 = pos[u]; x1, y1 = pos[v]
-                edge_x += [x0, x1, None]; edge_y += [y0, y1, None]
-            
-            node_x = [pos[n][0] for n in G.nodes()]
-            node_y = [pos[n][1] for n in G.nodes()]
-            
-            fig = go.Figure([
-                go.Scatter(
-                    x=edge_x, y=edge_y,
-                    mode='lines',
-                    line=dict(width=0.5, color='#888'),
-                    hoverinfo='none'
-                ),
-                go.Scatter(
-                    x=node_x, y=node_y,
-                    mode='markers+text',
-                    text=list(G.nodes()),
-                    textposition="top center",
-                    marker=dict(size=12, color='royalblue')
+                # Display Rules
+                st.dataframe(
+                    rules[['antecedents', 'consequents', 'support', 'confidence', 'lift']]
+                    .sort_values('lift', ascending=False)
+                    .head(10),
+                    use_container_width=True
                 )
-            ])
-            fig.update_layout(
-                showlegend=False,
-                margin=dict(t=0,b=0,l=0,r=0),
-                xaxis=dict(visible=False),
-                yaxis=dict(visible=False)
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception:
-            pass
+                
+                # Network Graph
+                st.markdown("##### Relationship Graph")
+                G = nx.DiGraph()
+                for _, r in rules.sort_values('lift', ascending=False).head(15).iterrows():
+                    G.add_edge(r['antecedents'], r['consequents'], weight=r['lift'])
+                
+                pos = nx.spring_layout(G, k=1.5, seed=42)
+                
+                edge_x, edge_y = [], []
+                for u, v in G.edges():
+                    x0, y0 = pos[u]; x1, y1 = pos[v]
+                    edge_x += [x0, x1, None]; edge_y += [y0, y1, None]
 
-# --- TAB 2: RFM / Segmentation ---
-with t2:
-    st.subheader("Customer Segmentation (RFM + KMeans)")
-    rfm = calculate_rfm(df, schema)
-    if not rfm.empty:
+                node_x, node_y, node_text = [], [], []
+                for node in G.nodes():
+                    node_x.append(pos[node][0])
+                    node_y.append(pos[node][1])
+                    node_text.append(node)
+
+                fig_net = go.Figure(data=[
+                    go.Scatter(x=edge_x, y=edge_y, mode='lines', line=dict(width=1, color='#888')),
+                    go.Scatter(x=node_x, y=node_y, mode='markers+text', text=node_text, 
+                               textposition="top center", marker=dict(size=12, color='green'))
+                ])
+                fig_net.update_layout(showlegend=False, xaxis=dict(visible=False), yaxis=dict(visible=False), margin=dict(t=0,b=0,l=0,r=0))
+                st.plotly_chart(fig_net, use_container_width=True)
+
+            else:
+                st.info("No rules found. Try lowering the Lift/Confidence threshold.")
+
+# --- TAB 2: Segmentation ---
+with tab2:
+    st.subheader("Customer Segmentation (RFM)")
+    
+    if all(k in schema.values() for k in [schema['customer'], schema['date'], schema['amount']]):
+        # RFM Calculation
+        now_date = df[schema['date']].max() + timedelta(days=1)
+        
+        # Filter positive amounts only for RFM
+        rfm_data = df[df[schema['amount']] > 0]
+        
+        rfm = rfm_data.groupby(schema['customer']).agg({
+            schema['date']: lambda x: (now_date - x.max()).days,
+            schema['customer']: 'count', # Frequency (using count of rows as proxy for interactions)
+            schema['amount']: 'sum'
+        }).rename(columns={
+            schema['date']: 'Recency',
+            schema['customer']: 'Frequency',
+            schema['amount']: 'Monetary'
+        }).reset_index()
+        
+        # K-Means
+        k = st.slider("Select K (Clusters)", 2, 5, 3)
         scaler = StandardScaler()
         rfm_scaled = scaler.fit_transform(rfm[['Recency', 'Frequency', 'Monetary']])
-        k = st.slider("K Clusters", 2, 6, 3)
-        rfm['Cluster'] = KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(rfm_scaled)
+        kmeans = KMeans(n_clusters=k, random_state=42)
+        rfm['Cluster'] = kmeans.fit_predict(rfm_scaled)
         
-        c1, c2 = st.columns([1, 2])
-        c1.dataframe(
-            rfm.groupby('Cluster')[['Recency','Frequency','Monetary']].mean().round(1),
-            use_container_width=True
-        )
-        c2.plotly_chart(
-            px.scatter_3d(
-                rfm,
-                x='Recency', y='Frequency', z='Monetary',
-                color='Cluster', opacity=0.6,
-                title="Customer Clusters in RFM Space"
-            ),
-            use_container_width=True
-        )
+        # 3D Chart
+        fig_3d = px.scatter_3d(rfm, x='Recency', y='Frequency', z='Monetary', color='Cluster', 
+                               title="3D Customer Segments", opacity=0.7)
+        st.plotly_chart(fig_3d, use_container_width=True)
+        
+        st.write("Cluster Stats:")
+        st.dataframe(rfm.groupby('Cluster')[['Recency', 'Frequency', 'Monetary']].mean())
+        
     else:
-        st.info("Not enough data or missing columns to compute RFM (need customer, date, and amount).")
+        st.error("Missing columns for RFM analysis (Customer, Date, Amount).")
 
-# --- TAB 3: Recommender ---
-with t3:
-    st.subheader("Smart Recommender")
-    # We reuse 'transactions' and 'rules' from Tab 1
-    if 'transactions' in locals() and transactions:
-        all_items = sorted(list(set([i for t in transactions for i in t])))
-        cart = st.multiselect("Cart Items:", all_items)
-        
-        if cart and 'rules' in locals() and not rules.empty:
-            recs = []
-            for _, r in rules.iterrows():
-                if set(r['antecedents']).issubset(set(cart)):
-                    add_ons = set(r['consequents']) - set(cart)
-                    if add_ons:
-                        recs.append({"Item": ', '.join(sorted(add_ons)), "Lift": r['lift']})
-            if recs:
-                rec_df = pd.DataFrame(recs).sort_values("Lift", ascending=False)
-                rec_df = rec_df.drop_duplicates("Item")
-                st.dataframe(rec_df, use_container_width=True)
-            else:
-                st.info("No add-ons found for this cart based on current rules.")
-        elif not rules.empty:
-            st.info("Select items in the cart above to see recommendations.")
-        else:
-            st.info("No rules available. Please adjust support/metric or enrich the data in the Market Basket tab.")
-    else:
-        st.info("No transactions built yet. Please check the Market Basket tab first.")
+# --- TAB 3: Data View ---
+with tab3:
+    st.dataframe(df.head(100))
