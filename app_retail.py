@@ -332,6 +332,48 @@ with tab2:
     else:
         st.error("Missing columns for RFM analysis (Customer, Date, Amount).")
 
-# --- TAB 3: Data View ---
+# --- TAB 3: Interactive Recommender ---
 with tab3:
-    st.dataframe(df.head(100))
+    st.subheader("🛒 Smart Cart Recommender")
+    st.markdown("Select items to see what the AI suggests adding next.")
+    
+    # 1. Check if rules exist from Tab 1
+    if 'rules' in locals() and not rules.empty:
+        
+        # 2. Get all unique products from the rules
+        all_products = sorted(list(set(rules['antecedents'].unique()) | set(rules['consequents'].unique())))
+        
+        # 3. User selects their "Cart"
+        selected_cart = st.multiselect("What is in the cart?", all_products)
+        
+        if selected_cart:
+            recommendations = []
+            
+            # 4. Logic: Find rules where the 'Antecedent' is in the cart
+            for _, r in rules.iterrows():
+                # Check if the "If" part of the rule is in the selected cart
+                # We handle both single items and sets
+                ant = r['antecedents']
+                if isinstance(ant, str):
+                    ant_set = {ant}
+                else:
+                    ant_set = set(ant)
+                
+                if ant_set.issubset(set(selected_cart)):
+                    recommendations.append({
+                        "Recommended Item": r['consequents'],
+                        "Confidence": f"{r['confidence']:.2%}",
+                        "Lift Score": f"{r['lift']:.2f}"
+                    })
+            
+            if recommendations:
+                rec_df = pd.DataFrame(recommendations).sort_values("Lift Score", ascending=False).drop_duplicates()
+                st.success(f"💡 Found {len(rec_df)} recommendations!")
+                st.dataframe(rec_df, use_container_width=True)
+            else:
+                st.info("No specific recommendations found for these items yet. Try lowering the Support/Threshold in the sidebar.")
+        else:
+            st.info("👈 Select items above to start.")
+            
+    else:
+        st.warning("⚠️ No rules available yet. Please go to 'Market Basket' (Tab 1) and adjust the sliders until rules are found.")
